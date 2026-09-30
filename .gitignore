@@ -1,0 +1,5 @@
+.vscode
+
+# Coverage output
+coverage.out
+coverage.html
