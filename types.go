@@ -109,6 +109,25 @@ type Wallet struct {
 // Total is what the wallet can spend now: both buckets together.
 func (w Wallet) Total() int64 { return w.Bonus + w.Purchased }
 
+// Taken is what a reversal entry took back: from the purchased bucket and
+// from holds in flight together. It is zero for every other kind.
+func (e Entry) Taken() int64 {
+	if e.Kind != KindReverse {
+		return 0
+	}
+	return e.FromHolds - e.Purchased
+}
+
+// Short is what a reversal entry could not take back, because the credits
+// were already spent: the loss the business absorbs. It is zero for every
+// other kind.
+func (e Entry) Short() int64 {
+	if e.Kind != KindReverse {
+		return 0
+	}
+	return e.Requested - e.Taken()
+}
+
 // Entry is one row of the ledger: a movement and the balances after it.
 //
 // The ledger is append-only. An entry is never updated or deleted; a mistake
@@ -140,6 +159,17 @@ type Entry struct {
 	// Hold is the id of the hold the entry belongs to, for hold, capture
 	// and release entries.
 	Hold string
+
+	// Requested and FromHolds describe a reversal; both are zero on every
+	// other kind. Requested is the amount the reversal asked for. FromHolds
+	// is the part taken from the purchased share of holds still in flight,
+	// which the buckets do not show: those credits were already out of the
+	// wallet, and they will not come back when the holds are released.
+	//
+	// What the reversal took is FromHolds - Purchased; what it could not
+	// take, because it was already spent, is Requested minus that.
+	Requested int64
+	FromHolds int64
 
 	// Origin is set on grants.
 	Origin Origin
@@ -174,6 +204,11 @@ type Hold struct {
 
 	// Ref is the caller's reference, copied from the charge.
 	Ref string
+
+	// Reversed is the part of FromPurchased a reversal took back while the
+	// hold was in flight: the money for those credits went back to the
+	// customer, so a release returns only FromPurchased - Reversed.
+	Reversed int64
 
 	// Status is where the hold is; SettledAt is when it was captured or
 	// released, zero while it is held.

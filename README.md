@@ -1,4 +1,4 @@
-[![Go Reference](https://img.shields.io/badge/godoc-reference-blue)](https://pkg.go.dev/github.com/goloop/ledger) [![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://github.com/goloop/ledger/blob/master/LICENSE) [![Stay with Ukraine](https://img.shields.io/static/v1?label=Stay%20with&message=Ukraine%20♥&color=ffD700&labelColor=0057B8&style=flat)](https://u24.gov.ua/)
+[![deps.dev](https://img.shields.io/badge/deps.dev-insights-4c8dbc)](https://deps.dev/go/github.com%2Fgoloop%2Fledger) [![Go Reference](https://img.shields.io/badge/godoc-reference-blue)](https://pkg.go.dev/github.com/goloop/ledger) [![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://github.com/goloop/ledger/blob/master/LICENSE) [![Stay with Ukraine](https://img.shields.io/static/v1?label=Stay%20with&message=Ukraine%20♥&color=ffD700&labelColor=0057B8&style=flat)](https://u24.gov.ua/)
 
 # ledger
 
@@ -28,14 +28,16 @@ same things wrong:
 - **Expiry that is not.** Bonus credits and plan allowances are supposed to
   expire, the monthly job misses a run, and they pile up.
 - **Refunds after spending.** A chargeback arrives for credits that were
-  already used, and the code either crashes or leaves a negative balance.
+  already used, and the code either crashes or leaves a negative balance. Or
+  it arrives while an action holds them, the action fails, and the refunded
+  credits come back to the wallet.
 - **No trail.** A support ticket asks "where did my 300 credits go" and the
   only answer is a number in a column.
 
 `ledger` solves these once: every movement is keyed and idempotent, holds
 settle exactly once, updates of one account are serialized by the store, the
-bonus bucket expires by itself, reversals take what is left and report the
-shortfall, and every movement is an entry with the balances after it - which
+bonus bucket expires by itself, reversals take what is left - holds in
+flight included - and report the shortfall, and every movement is an entry with the balances after it - which
 `Audit` can prove add up.
 
 ## Features
@@ -50,7 +52,8 @@ shortfall, and every movement is an entry with the balances after it - which
 - **Plan allowances.** `Grant.Replace` starts a new period instead of piling
   on the old one; `Origin` records whether bonus credits were a gift or part
   of a paid plan.
-- **Reversals** for refunds and chargebacks, with the shortfall reported.
+- **Reversals** for refunds and chargebacks: they reach holds in flight,
+  report the shortfall, and take all or nothing for a withdrawal (`Exact`).
 - **History** that is append-only, gapless and self-checking (`Audit`).
 - **Pluggable storage.** A small `Store` interface; `MemoryStore` as the
   reference; `ledgertest.Store` checks a database store against the same
@@ -79,13 +82,19 @@ err = l.Grant(ctx, "user-42", ledger.Grant{
 // An action that costs 25 credits: bonus first, then purchased.
 h, err := l.Hold(ctx, "user-42", ledger.Charge{Key: "job-7", Amount: 25_00, Ref: "pdf-to-word"})
 if errors.Is(err, ledger.ErrInsufficient) {
-	// 402 Payment Required
+	return errPaymentRequired // 402
 }
-defer l.Release(ctx, "user-42", h.ID) // a no-op once captured
+if err != nil {
+	return err
+}
+settle := context.WithoutCancel(ctx) // a dropped client must not undo a settlement
 if err := run(job); err != nil {
-	return err // released: a failure costs nothing
+	_ = l.Release(settle, "user-42", h.ID) // a failure costs nothing
+	return err
 }
-err = l.Capture(ctx, "user-42", h.ID)
+// The action ran: on an error, retry the Capture. Never release here, and
+// never defer the Release - that would give the action away.
+err = l.Capture(settle, "user-42", h.ID)
 ```
 
 Amounts are in a unit you choose; hundredths of a credit are recommended, so
@@ -117,7 +126,8 @@ of the way. The reference shows each model in code:
 
 ## A real-world example
 
-Paddle sells a credit pack; the webhook credits it; an action spends it.
+Paddle sells a credit pack; the webhook credits it, and takes it back when
+the money goes back.
 
 ```go
 wh := paddle.NewWebhook(os.Getenv("PADDLE_WEBHOOK_SECRET"))
@@ -128,22 +138,49 @@ http.HandleFunc("POST /webhooks/paddle", func(w http.ResponseWriter, r *http.Req
 		http.Error(w, "bad signature", http.StatusBadRequest)
 		return
 	}
-	if ev.Type == paddle.EventTransactionCompleted {
-		tx, _ := ev.Transaction()
-		p, err := purchases.ByTransaction(r.Context(), tx.ID) // your table
-		if err == nil {
-			// The transaction id is the key: a repeated delivery is a no-op.
-			err = l.Deposit(r.Context(), p.Account, ledger.Deposit{
-				Key: tx.ID, Amount: p.Credits, Ref: tx.ID,
-			})
-		}
-		if err != nil {
-			http.Error(w, "retry", http.StatusInternalServerError)
-			return
-		}
+	if err := handle(r.Context(), ev); err != nil {
+		http.Error(w, "retry", http.StatusInternalServerError) // Paddle sends it again
+		return
 	}
 	w.WriteHeader(http.StatusOK)
 })
+
+// handle is safe to run twice for one event: every ledger call is keyed.
+func handle(ctx context.Context, ev *paddle.Event) error {
+	switch ev.Type {
+	case paddle.EventTransactionCompleted:
+		tx, err := ev.Transaction()
+		if err != nil {
+			return err
+		}
+		p, err := purchases.ByTransaction(ctx, tx.ID) // your table
+		if err != nil {
+			return err
+		}
+		// The transaction id is the key: a repeated delivery is a no-op.
+		return l.Deposit(ctx, p.Account, ledger.Deposit{Key: tx.ID, Amount: p.Credits, Ref: tx.ID})
+
+	case paddle.EventAdjustmentCreated, paddle.EventAdjustmentUpdated:
+		adj, err := ev.Adjustment()
+		if err != nil {
+			return err
+		}
+		if adj.Action != paddle.ActionRefund && adj.Action != paddle.ActionChargeback ||
+			adj.Status != paddle.AdjustmentApproved {
+			return nil
+		}
+		p, err := purchases.ByTransaction(ctx, adj.TransactionID)
+		if err != nil {
+			return err
+		}
+		// The adjustment id is the key: created and updated may both arrive.
+		_, err = l.Reverse(ctx, p.Account, ledger.Reversal{
+			Key: adj.ID, Amount: p.Credits, Ref: adj.TransactionID,
+		})
+		return err
+	}
+	return nil
+}
 ```
 
 ## The API at a glance
@@ -155,7 +192,7 @@ http.HandleFunc("POST /webhooks/paddle", func(w http.ResponseWriter, r *http.Req
 | `Deposit` | add purchased credits |
 | `Hold` / `Capture` / `Release` | set a price aside, then settle it |
 | `Spend` | charge at once |
-| `Reverse` | take purchased credits back after a refund |
+| `Reverse` | take purchased credits back after a refund, holds in flight included |
 | `Adjust` | a manual correction |
 | `Balance` | the wallet now, expiry applied |
 | `Entries` | the history, newest first, paged |

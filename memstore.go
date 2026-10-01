@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -95,7 +96,7 @@ func (s *MemoryStore) Entries(_ context.Context, account string, before int64, l
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	all := s.entries[account]
-	out := make([]Entry, 0, min(limit, len(all)))
+	out := make([]Entry, 0, max(0, min(limit, len(all))))
 	for i := len(all) - 1; i >= 0 && len(out) < limit; i-- {
 		if before > 0 && all[i].Seq >= before {
 			continue
@@ -117,7 +118,7 @@ func (s *MemoryStore) StaleHolds(_ context.Context, createdBefore time.Time, lim
 			}
 		}
 	}
-	slices.SortFunc(out, func(a, b Hold) int { return a.CreatedAt.Compare(b.CreatedAt) })
+	slices.SortFunc(out, compareHolds)
 	if len(out) > limit {
 		out = out[:limit]
 	}
@@ -144,4 +145,24 @@ func (v memView) Entry(_ context.Context, key string) (Entry, bool, error) {
 func (v memView) Hold(_ context.Context, id string) (Hold, bool, error) {
 	h, ok := v.s.holds[v.account][id]
 	return h, ok, nil
+}
+
+func (v memView) Held(context.Context) ([]Hold, error) {
+	var out []Hold
+	for _, h := range v.s.holds[v.account] {
+		if h.Status == HoldHeld {
+			out = append(out, h)
+		}
+	}
+	slices.SortFunc(out, compareHolds)
+	return out, nil
+}
+
+// compareHolds orders holds oldest first, by id when two were created at the
+// same instant, so the order never depends on map iteration.
+func compareHolds(a, b Hold) int {
+	if c := a.CreatedAt.Compare(b.CreatedAt); c != 0 {
+		return c
+	}
+	return strings.Compare(a.ID, b.ID)
 }

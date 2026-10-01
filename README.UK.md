@@ -1,4 +1,4 @@
-[![Go Reference](https://img.shields.io/badge/godoc-reference-blue)](https://pkg.go.dev/github.com/goloop/ledger) [![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://github.com/goloop/ledger/blob/master/LICENSE) [![Stay with Ukraine](https://img.shields.io/static/v1?label=Stay%20with&message=Ukraine%20♥&color=ffD700&labelColor=0057B8&style=flat)](https://u24.gov.ua/)
+[![deps.dev](https://img.shields.io/badge/deps.dev-insights-4c8dbc)](https://deps.dev/go/github.com%2Fgoloop%2Fledger) [![Go Reference](https://img.shields.io/badge/godoc-reference-blue)](https://pkg.go.dev/github.com/goloop/ledger) [![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://github.com/goloop/ledger/blob/master/LICENSE) [![Stay with Ukraine](https://img.shields.io/static/v1?label=Stay%20with&message=Ukraine%20♥&color=ffD700&labelColor=0057B8&style=flat)](https://u24.gov.ua/)
 
 # ledger
 
@@ -27,14 +27,16 @@
 - **Згоряння, якого немає.** Бонуси й ліміти планів мали згоряти, щомісячна
   задача пропустила запуск - і вони накопичуються.
 - **Повернення після витрати.** Chargeback приходить за вже використані
-  кредити, і код або падає, або лишає від'ємний баланс.
+  кредити, і код або падає, або лишає від'ємний баланс. Або приходить, поки
+  їх тримає резерв дії, дія падає, і повернені гроші лишають кредити в
+  гаманці.
 - **Немає сліду.** У тікеті питають «куди поділися мої 300 кредитів», а
   відповісти можна лише числом у колонці.
 
 `ledger` розв'язує це один раз: кожен рух має ключ і ідемпотентний, резерв
 завершується рівно один раз, оновлення одного акаунта впорядковує сховище,
-бонусний кошик згоряє сам, сторнування забирає залишок і повідомляє про
-нестачу, а кожен рух - це запис із балансами після нього, і `Audit` доводить,
+бонусний кошик згоряє сам, сторнування забирає залишок - разом із
+резервами в дорозі - і повідомляє про нестачу, а кожен рух - це запис із балансами після нього, і `Audit` доводить,
 що вони сходяться.
 
 ## Можливості
@@ -48,7 +50,8 @@
 - **Ліміти планів.** `Grant.Replace` починає новий період замість
   накопичувати старий; `Origin` фіксує, чи бонус був подарунком, чи частиною
   оплаченого плану.
-- **Сторнування** для повернень і chargeback, з повідомленням про нестачу.
+- **Сторнування** для повернень і chargeback: дістає резерви в дорозі,
+  повідомляє про нестачу і для відмови бере все або нічого (`Exact`).
 - **Історія**, що лише дописується, без пропусків і з самоперевіркою
   (`Audit`).
 - **Змінне сховище.** Невеликий інтерфейс `Store`; `MemoryStore` як еталон;
@@ -78,13 +81,19 @@ err = l.Grant(ctx, "user-42", ledger.Grant{
 // Дія за 25 кредитів: спершу бонусні, потім куплені.
 h, err := l.Hold(ctx, "user-42", ledger.Charge{Key: "job-7", Amount: 25_00, Ref: "pdf-to-word"})
 if errors.Is(err, ledger.ErrInsufficient) {
-	// 402 Payment Required
+	return errPaymentRequired // 402
 }
-defer l.Release(ctx, "user-42", h.ID) // після Capture нічого не робить
+if err != nil {
+	return err
+}
+settle := context.WithoutCancel(ctx) // клієнт, що відключився, не скасовує розрахунок
 if err := run(job); err != nil {
-	return err // резерв повернуто: невдача нічого не коштує
+	_ = l.Release(settle, "user-42", h.ID) // невдача нічого не коштує
+	return err
 }
-err = l.Capture(ctx, "user-42", h.ID)
+// Дія виконана: на помилці Capture - повторити. Не звільняти тут і не
+// відкладати Release через defer - це подарувало б дію.
+err = l.Capture(settle, "user-42", h.ID)
 ```
 
 Суми - в одиниці, яку обираєте ви; рекомендовано соті частки кредиту, тож
@@ -115,7 +124,8 @@ Ledger не знає цін і планів; він переміщує кред�
 
 ## Реальний приклад
 
-Paddle продає пакет кредитів; вебхук їх нараховує; дія витрачає.
+Paddle продає пакет кредитів; вебхук їх нараховує і забирає, коли гроші
+повертаються.
 
 ```go
 wh := paddle.NewWebhook(os.Getenv("PADDLE_WEBHOOK_SECRET"))
@@ -126,22 +136,49 @@ http.HandleFunc("POST /webhooks/paddle", func(w http.ResponseWriter, r *http.Req
 		http.Error(w, "bad signature", http.StatusBadRequest)
 		return
 	}
-	if ev.Type == paddle.EventTransactionCompleted {
-		tx, _ := ev.Transaction()
-		p, err := purchases.ByTransaction(r.Context(), tx.ID) // ваша таблиця
-		if err == nil {
-			// id транзакції - це ключ: повторна доставка нічого не змінює.
-			err = l.Deposit(r.Context(), p.Account, ledger.Deposit{
-				Key: tx.ID, Amount: p.Credits, Ref: tx.ID,
-			})
-		}
-		if err != nil {
-			http.Error(w, "retry", http.StatusInternalServerError)
-			return
-		}
+	if err := handle(r.Context(), ev); err != nil {
+		http.Error(w, "retry", http.StatusInternalServerError) // Paddle надішле ще раз
+		return
 	}
 	w.WriteHeader(http.StatusOK)
 })
+
+// handle безпечно запускати двічі для однієї події: кожен виклик ledger має ключ.
+func handle(ctx context.Context, ev *paddle.Event) error {
+	switch ev.Type {
+	case paddle.EventTransactionCompleted:
+		tx, err := ev.Transaction()
+		if err != nil {
+			return err
+		}
+		p, err := purchases.ByTransaction(ctx, tx.ID) // ваша таблиця
+		if err != nil {
+			return err
+		}
+		// id транзакції - це ключ: повторна доставка нічого не змінює.
+		return l.Deposit(ctx, p.Account, ledger.Deposit{Key: tx.ID, Amount: p.Credits, Ref: tx.ID})
+
+	case paddle.EventAdjustmentCreated, paddle.EventAdjustmentUpdated:
+		adj, err := ev.Adjustment()
+		if err != nil {
+			return err
+		}
+		if adj.Action != paddle.ActionRefund && adj.Action != paddle.ActionChargeback ||
+			adj.Status != paddle.AdjustmentApproved {
+			return nil
+		}
+		p, err := purchases.ByTransaction(ctx, adj.TransactionID)
+		if err != nil {
+			return err
+		}
+		// id adjustment - це ключ: можуть прийти і created, і updated.
+		_, err = l.Reverse(ctx, p.Account, ledger.Reversal{
+			Key: adj.ID, Amount: p.Credits, Ref: adj.TransactionID,
+		})
+		return err
+	}
+	return nil
+}
 ```
 
 ## API коротко
@@ -153,7 +190,7 @@ http.HandleFunc("POST /webhooks/paddle", func(w http.ResponseWriter, r *http.Req
 | `Deposit` | додати куплені кредити |
 | `Hold` / `Capture` / `Release` | відкласти ціну, потім завершити |
 | `Spend` | списати одразу |
-| `Reverse` | забрати куплені кредити після повернення коштів |
+| `Reverse` | забрати куплені кредити після повернення коштів, разом із резервами в дорозі |
 | `Adjust` | ручне виправлення |
 | `Balance` | гаманець зараз, з урахуванням згоряння |
 | `Entries` | історія, найновіші першими, посторінково |

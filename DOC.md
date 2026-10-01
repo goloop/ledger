@@ -69,6 +69,11 @@ Amounts are `int64` in a unit the application chooses. Store hundredths of a
 credit rather than whole credits: a 15% discount on a one-credit price then
 still has somewhere to go instead of rounding to zero.
 
+No amount, and no bucket, may exceed `MaxAmount` (2^53 - 1, the largest
+integer every JSON reader keeps exact). It is far beyond any real balance:
+reaching it means an amount came from unchecked input, and the ledger
+refuses it with `ErrInvalid` instead of overflowing.
+
 The exchange rate between money and credits is the application's, and it
 should be fixed once credits are sold: changing it devalues what customers
 already hold.
@@ -79,9 +84,13 @@ Every method that changes a wallet takes a key, unique within the account.
 
 - A repeated call with the same key changes nothing and reports what the
   first call did: `Hold` returns the same hold, `Reverse` the same amount.
+  The exception is a hold that was released: `Hold` returns it with
+  `ErrReleased`, because the action it paid for must not run on it.
 - A call that reuses a key for a different movement - another kind, another
-  amount, another reference - fails with `ErrKeyReused`. A retry must repeat
-  the request exactly; a new request needs a new key.
+  amount, another reference, another origin of a grant - fails with
+  `ErrKeyReused`. A retry must repeat the request exactly; a new request
+  needs a new key. A grant's `Until` and `Replace` are not compared: the
+  first call decided them.
 - Keys are at most `MaxKeyLength` (255) bytes. The prefix `ledger:` is
   reserved for the entries the ledger writes itself (captures, releases,
   expiries).
@@ -126,6 +135,11 @@ err := l.Grant(ctx, team, ledger.Grant{
 })
 ```
 
+A hold that took bonus credits of the old period and is released after
+`Replace` brings them back into the new period's bucket, under the new
+expiry. The amount is at most one action's price, so the ledger accepts it
+rather than track periods per hold.
+
 `Origin` separates a gift (`OriginPromo`: welcome, level bonus, goodwill)
 from what a subscriber paid for (`OriginPlan`). Both expire and are spent the
 same way; the difference is what the business owes, and the origin keeps it
@@ -155,23 +169,41 @@ h, err := l.Hold(ctx, account, ledger.Charge{Key: job.ID, Amount: price, Ref: "p
 if err != nil {
 	return err // *InsufficientError when the wallet cannot cover it
 }
-defer l.Release(ctx, account, h.ID)
+settle := context.WithoutCancel(ctx)
 
 if err := run(job); err != nil {
+	_ = l.Release(settle, account, h.ID) // a failure costs nothing
 	return err
 }
-return l.Capture(ctx, account, h.ID)
+return l.Capture(settle, account, h.ID)
 ```
 
 - `Hold` takes the price out of the buckets, bonus first, and returns the
   hold with `FromBonus` and `FromPurchased`.
 - `Capture` makes it final. Capturing twice is a no-op.
 - `Release` puts it back into the buckets it came from. Releasing twice is a
-  no-op, and releasing a captured hold is a no-op too, which makes the
-  deferred release above correct without a condition.
+  no-op, and releasing a captured hold is a no-op too.
 - `Capture` of a released hold fails with `ErrReleased`: the credits are
   already back, and the action ran unpaid. The caller decides whether to
   charge again or let it go.
+- `Hold` repeated with the key of a released hold returns it with
+  `ErrReleased`. A new attempt at the action needs a new key
+  (`job-7:2`). Repeated with the key of a captured hold, it returns the hold
+  with `Status` `HoldCaptured` and no error: the action was paid for and
+  ran, do not run it again.
+
+Two rules keep a hold honest:
+
+- **Release on the failure path only, never in a `defer`.** If the action
+  ran and `Capture` failed - the database dropped the connection - a
+  deferred `Release` would put the credits back and the action would be
+  free. Retry the `Capture` instead (it is idempotent), from a worker if
+  needed.
+- **Settle on a context the client cannot cancel.** A request whose client
+  disconnects cancels its context; `Capture` and `Release` would both fail,
+  and the hold would wait for `ReleaseStale` - which gives an action that
+  ran away. `context.WithoutCancel(ctx)` keeps the request's values and
+  drops its cancellation.
 
 When bonus credits come back after the bucket expired while the action ran,
 they get a grace period (`DefaultReleaseGrace`, 24 hours) instead of arriving
@@ -200,9 +232,25 @@ if taken < purchase.Credits {
 }
 ```
 
-A reversal takes back purchased credits after the money went back. It takes
-what is left, up to the amount; credits already spent stay spent, and the
-shortfall is returned and noted on the entry. Bonus credits are never taken.
+A reversal takes back purchased credits after the money went back, up to the
+amount:
+
+1. what is left in the purchased bucket;
+2. then the purchased share of holds still in flight. Each hold records the
+   part taken in `Hold.Reversed`, and a release returns only the rest. Without
+   this, a customer could start an action, get the money back, let the action
+   fail and keep the credits.
+
+Credits already spent stay spent: the action they paid for ran. Bonus
+credits are never taken. The entry records the request and the result as
+numbers: `Requested`, `FromHolds`, and `Taken()` and `Short()` computed from
+them. A repeated call with the same key returns the same `taken`; one with
+another amount fails with `ErrKeyReused`.
+
+`Exact` takes the whole amount from the purchased bucket or nothing, failing
+with `*InsufficientError`. Credits in holds do not count: an action in
+flight is use. It is the check for the withdrawal of an unused pack, made in
+the same step as the reversal.
 
 ## Adjustments
 
@@ -238,9 +286,16 @@ if err := l.Audit(ctx, account); errors.Is(err, ledger.ErrCorrupt) {
 ```
 
 `Audit` replays the whole history: gapless numbering, every recorded balance
-equal to the previous one plus the movement, no bucket below zero, and the
-last balance equal to the wallet. It reads every entry of the account, so run
-it from a reconciliation job, not from a request.
+equal to the previous one plus the movement, no bucket below zero, the first
+entry starting from an empty wallet, and the last balance equal to the
+wallet.
+
+It takes no lock and is safe on a live system: it reads the wallet first and
+checks the entries up to the wallet's `Seq`, which never change, so a
+movement made during the audit does not look like corruption. It walks the
+history a page at a time, newest first, without holding it in memory. It
+still reads every entry, so run it from a reconciliation job, not from a
+request.
 
 ## Stale holds
 
@@ -249,8 +304,14 @@ n, err := l.ReleaseStale(ctx, 30*time.Minute, 100)
 ```
 
 Releases holds that have been held longer than the age - left behind by a
-process that died between the hold and its settlement. Run it from a periodic
-worker, with an age comfortably longer than the slowest action.
+process that died between the hold and its settlement - and returns how many
+it released. A hold that fails to release does not stop the sweep: the
+failures come back joined in the error, next to the count. Only a cancelled
+context stops it early. The limit is capped at 1000.
+
+Run it from a periodic worker, with an age comfortably longer than the
+slowest action **and** than the time a failed `Capture` is retried: a stale
+release of a hold whose action ran gives the action away.
 
 ## Pricing models
 
@@ -373,13 +434,15 @@ Who may spend from it is the application's permission check before `Hold`.
 ### Withdrawal, refunds and chargebacks
 
 ```go
-// The 14-day withdrawal for an unused pack: the credits must still be there.
-w, _ := l.Balance(ctx, p.Account)
-if withinWithdrawal(p) && w.Purchased >= p.Credits {
+// The 14-day withdrawal for an unused pack: all of the credits, or nothing.
+if withinWithdrawal(p) {
 	_, err = l.Reverse(ctx, p.Account, ledger.Reversal{
-		Key: "withdraw:" + p.ID, Amount: p.Credits, Ref: p.TransactionID,
+		Key: "withdraw:" + p.ID, Amount: p.Credits, Ref: p.TransactionID, Exact: true,
 	})
-	// then ask the provider for the refund; retry it from a worker if it fails
+	if errors.Is(err, ledger.ErrInsufficient) {
+		// part of the pack is used: the right of withdrawal no longer applies
+	}
+	// on success, ask the provider for the refund; retry it from a worker if it fails
 }
 
 // A refund or chargeback started at the provider: take back what is left.
@@ -426,6 +489,9 @@ The contract is small:
 - **`fn` may run more than once** if the database aborts and the store
   retries; it has no side effects.
 - **An error from `fn`, or a nil `Change`, writes nothing.**
+- **`View.Held` lists the account's open holds**, oldest first, as last
+  written. It runs under the same lock, so the list cannot change while a
+  reversal uses it.
 
 In PostgreSQL the lock is `SELECT ... FOR UPDATE` on the wallet row, after an
 `INSERT ... ON CONFLICT DO NOTHING` that makes the row exist:
@@ -450,6 +516,8 @@ CREATE TABLE ledger_entries (
     bonus_after     bigint NOT NULL,
     purchased_after bigint NOT NULL,
     hold            text   NOT NULL DEFAULT '',
+    requested       bigint NOT NULL DEFAULT 0,
+    from_holds      bigint NOT NULL DEFAULT 0,
     origin          text   NOT NULL DEFAULT '',
     ref             text   NOT NULL DEFAULT '',
     note            text   NOT NULL DEFAULT '',
@@ -465,16 +533,34 @@ CREATE TABLE ledger_holds (
     amount         bigint NOT NULL,
     from_bonus     bigint NOT NULL,
     from_purchased bigint NOT NULL,
+    reversed       bigint NOT NULL DEFAULT 0,
     ref            text   NOT NULL DEFAULT '',
-    status         text   NOT NULL,
+    status         text   NOT NULL CHECK (status IN ('held', 'captured', 'released')),
     created_at     timestamptz NOT NULL,
-    settled_at     timestamptz
+    settled_at     timestamptz,
+    CHECK (amount = from_bonus + from_purchased),
+    CHECK (reversed BETWEEN 0 AND from_purchased)
 );
 CREATE INDEX ledger_holds_stale ON ledger_holds (created_at) WHERE status = 'held';
+CREATE INDEX ledger_holds_open ON ledger_holds (account, created_at) WHERE status = 'held';
+
+-- The history is append-only: refuse any change to it.
+CREATE FUNCTION ledger_entries_append_only() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'ledger_entries is append-only';
+END $$;
+CREATE TRIGGER ledger_entries_append_only BEFORE UPDATE OR DELETE ON ledger_entries
+    FOR EACH ROW EXECUTE FUNCTION ledger_entries_append_only();
 ```
 
 The primary key on `(account, seq)` is a second line of defence: a store
-that forgot the lock fails loudly on it instead of losing a movement.
+that forgot the lock fails loudly on it instead of losing a movement. The
+`CHECK` constraints and the trigger make the database refuse what the ledger
+never writes: a hold whose parts do not add up, a status it does not know,
+and any change to the history. Set `SET LOCAL lock_timeout` in the
+transaction, so one stuck request does not queue every other request of the
+account behind it.
 
 Then prove it:
 
@@ -493,10 +579,10 @@ one account; a store without the row lock fails it.
 
 | Error | Meaning |
 |---|---|
-| `ErrInvalid` | refused before looking at the wallet: empty or reserved key, non-positive amount, expiry in the past |
+| `ErrInvalid` | refused before looking at the wallet: empty or reserved key, non-positive amount or one beyond `MaxAmount`, expiry in the past; also a movement that would take a bucket beyond `MaxAmount` |
 | `ErrInsufficient` / `*InsufficientError` | the wallet cannot cover the amount; `Required` and `Available` say by how much |
 | `ErrNotFound` | the hold does not exist in the account |
-| `ErrReleased` | `Capture` of a hold that was already released |
+| `ErrReleased` | `Capture` of a hold that was already released, or `Hold` repeated with the key of one |
 | `ErrKeyReused` | the key was used for a different movement |
 | `ErrDuplicateKey` | returned by a `Store`; means the store checked and wrote in separate transactions |
 | `ErrCorrupt` | `Audit` found a history that does not add up |

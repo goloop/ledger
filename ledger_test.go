@@ -311,14 +311,18 @@ func TestReverse(t *testing.T) {
 		t.Fatalf("a reversal takes what is left of the purchased credits: want 600, got %d", taken)
 	}
 	want(t, l, "a", 0, 0)
-	if e := entries(t, l, "a")[0]; e.Note != "chargeback (short by 400)" {
-		t.Fatalf("the shortfall must be recorded, got note %q", e.Note)
+	if e := entries(t, l, "a")[0]; e.Requested != 1000 || e.Taken() != 600 || e.Short() != 400 || e.Note != "chargeback" {
+		t.Fatalf("the shortfall must be recorded as numbers, got requested %d taken %d short %d note %q",
+			e.Requested, e.Taken(), e.Short(), e.Note)
 	}
 
 	again, err := l.Reverse(ctx, "a", ledger.Reversal{Key: "adj_1", Amount: 1000, Ref: "txn_1"})
 	mustOK(t, err)
 	if again != 600 {
 		t.Fatalf("a repeated reversal reports what the first took, got %d", again)
+	}
+	if _, err := l.Reverse(ctx, "a", ledger.Reversal{Key: "adj_1", Amount: 500, Ref: "txn_1"}); !errors.Is(err, ledger.ErrKeyReused) {
+		t.Fatalf("a reversal key reused for another amount must be refused, got %v", err)
 	}
 
 	mustOK(t, l.Grant(ctx, "b", ledger.Grant{Key: "g", Amount: 50, Until: month()}))

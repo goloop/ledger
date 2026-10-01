@@ -42,13 +42,18 @@ func ExampleLedger_Hold() {
 	if err != nil {
 		return
 	}
-	// Release unless captured: a no-op after a successful Capture.
-	defer l.Release(ctx, "user-42", h.ID)
-
+	// Settle on a context the client cannot cancel: once the action ran,
+	// a dropped connection must not undo its payment.
+	settle := context.WithoutCancel(ctx)
 	if err := convert(); err != nil {
-		return // the deferred Release gives the 40 back
+		_ = l.Release(settle, "user-42", h.ID) // a failure costs nothing
+		return
 	}
-	_ = l.Capture(ctx, "user-42", h.ID)
+	// The action ran. A failed Capture is retried, never answered with a
+	// Release: that would give the action away.
+	if err := l.Capture(settle, "user-42", h.ID); err != nil {
+		return
+	}
 
 	w, _ := l.Balance(ctx, "user-42")
 	fmt.Println(w.Purchased)
@@ -82,13 +87,36 @@ func ExampleLedger_Reverse() {
 	ctx := context.Background()
 	l := ledger.New(ledger.NewMemoryStore())
 	_ = l.Deposit(ctx, "user-42", ledger.Deposit{Key: "txn_01", Amount: 1000})
-	_ = l.Spend(ctx, "user-42", ledger.Charge{Key: "job-9", Amount: 700})
+	_ = l.Spend(ctx, "user-42", ledger.Charge{Key: "job-9", Amount: 600})
+	h, _ := l.Hold(ctx, "user-42", ledger.Charge{Key: "job-10", Amount: 100})
 
-	// A chargeback for the whole pack: what is left comes back, what was
-	// spent stays spent, and the shortfall is reported.
+	// A chargeback for the whole pack: what is left comes back, so does the
+	// purchased share of the hold in flight, and what was spent stays spent.
 	taken, _ := l.Reverse(ctx, "user-42", ledger.Reversal{Key: "adj_01", Amount: 1000, Ref: "txn_01"})
-	fmt.Println("taken:", taken, "short:", 1000-taken)
-	// Output: taken: 300 short: 700
+	e, _ := l.Entries(ctx, "user-42", 0, 1)
+	fmt.Println("taken:", taken, "from holds:", e[0].FromHolds, "short:", e[0].Short())
+
+	// The action fails, and its credits do not come back: they were refunded.
+	_ = l.Release(ctx, "user-42", h.ID)
+	w, _ := l.Balance(ctx, "user-42")
+	fmt.Println("purchased:", w.Purchased)
+	// Output:
+	// taken: 400 from holds: 100 short: 600
+	// purchased: 0
+}
+
+func ExampleReversal_exact() {
+	ctx := context.Background()
+	l := ledger.New(ledger.NewMemoryStore())
+	_ = l.Deposit(ctx, "user-42", ledger.Deposit{Key: "txn_01", Amount: 1000})
+	_ = l.Spend(ctx, "user-42", ledger.Charge{Key: "job-1", Amount: 1})
+
+	// The withdrawal of an unused pack: all of it, or nothing.
+	_, err := l.Reverse(ctx, "user-42", ledger.Reversal{
+		Key: "withdraw:p-1", Amount: 1000, Ref: "txn_01", Exact: true,
+	})
+	fmt.Println(errors.Is(err, ledger.ErrInsufficient))
+	// Output: true
 }
 
 func ExampleInsufficientError() {

@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -14,6 +15,12 @@ const DefaultReleaseGrace = 24 * time.Hour
 
 // MaxKeyLength is the longest key the ledger accepts, in bytes.
 const MaxKeyLength = 255
+
+// MaxAmount is the largest amount a movement may carry and a bucket may hold:
+// 2^53 - 1, the largest integer every JSON reader keeps exact. It is far
+// beyond any real balance, so reaching it means an amount came from somewhere
+// it should not have, and the ledger refuses it instead of overflowing.
+const MaxAmount = 1<<53 - 1
 
 // reservedPrefix starts the keys the ledger makes for its own entries
 // (captures, releases, expiries). Callers cannot use it, so a caller key can
@@ -139,6 +146,13 @@ type Reversal struct {
 	// Amount is how much the reversed money bought; it must be positive.
 	Amount int64
 
+	// Exact takes the whole amount from the purchased bucket or nothing: a
+	// wallet that holds less fails with an *InsufficientError and nothing is
+	// written. It is the check for a withdrawal of an unused pack, made in
+	// the same step as the reversal so nothing can be spent in between.
+	// Credits in holds do not count: an action in flight is use.
+	Exact bool
+
 	Ref  string
 	Note string
 }
@@ -189,8 +203,8 @@ func (l *Ledger) Grant(ctx context.Context, account string, g Grant) error {
 	if err := checkKey(g.Key); err != nil {
 		return err
 	}
-	if g.Amount <= 0 {
-		return invalid("grant amount must be positive, got %d", g.Amount)
+	if err := checkAmount("grant", g.Amount); err != nil {
+		return err
 	}
 	if g.Until.IsZero() {
 		return invalid("grant needs an expiry")
@@ -205,7 +219,7 @@ func (l *Ledger) Grant(ctx context.Context, account string, g Grant) error {
 
 	return l.update(ctx, account, func(u *unit) error {
 		done, err := u.replay(g.Key, func(e Entry) bool {
-			return e.Kind == KindGrant && e.Bonus == g.Amount && e.Ref == g.Ref
+			return e.Kind == KindGrant && e.Bonus == g.Amount && e.Origin == g.Origin && e.Ref == g.Ref
 		})
 		if done || err != nil {
 			return err
@@ -246,8 +260,8 @@ func (l *Ledger) Deposit(ctx context.Context, account string, d Deposit) error {
 	if err := checkKey(d.Key); err != nil {
 		return err
 	}
-	if d.Amount <= 0 {
-		return invalid("deposit amount must be positive, got %d", d.Amount)
+	if err := checkAmount("deposit", d.Amount); err != nil {
+		return err
 	}
 	return l.update(ctx, account, func(u *unit) error {
 		done, err := u.replay(d.Key, func(e Entry) bool {
@@ -270,9 +284,12 @@ func (l *Ledger) Deposit(ctx context.Context, account string, d Deposit) error {
 // the hold. The caller captures it when the action succeeds and releases it
 // when the action fails.
 //
-// A repeated call with the same key returns the hold the first call made, in
-// whatever state it is now, and takes nothing more. A wallet that cannot
-// cover the amount returns an *InsufficientError.
+// A repeated call with the same key takes nothing more and returns the hold
+// the first call made. A hold that was released comes back with ErrReleased:
+// the action it paid for must not run on it, and a new attempt needs a new
+// key. A captured one comes back without an error and with Status
+// HoldCaptured, which means the action was already paid for and ran. A wallet
+// that cannot cover the amount returns an *InsufficientError.
 func (l *Ledger) Hold(ctx context.Context, account string, c Charge) (Hold, error) {
 	if err := checkCharge(c); err != nil {
 		return Hold{}, err
@@ -298,6 +315,9 @@ func (l *Ledger) Hold(ctx context.Context, account string, c Charge) (Hold, erro
 				return fmt.Errorf("%w: %q", ErrKeyReused, c.Key)
 			}
 			out = h
+			if h.Status == HoldReleased {
+				return fmt.Errorf("%w: %q was released, the key %q needs a new attempt", ErrReleased, h.ID, c.Key)
+			}
 			return nil
 		}
 
@@ -332,6 +352,9 @@ func (l *Ledger) Hold(ctx context.Context, account string, c Charge) (Hold, erro
 		out = h
 		return nil
 	})
+	if errors.Is(err, ErrReleased) {
+		return out, err
+	}
 	if err != nil {
 		return Hold{}, err
 	}
@@ -389,11 +412,17 @@ func (l *Ledger) Spend(ctx context.Context, account string, c Charge) error {
 
 // Reverse takes purchased credits back and returns how many it took.
 //
-// It takes what is left, up to the amount: credits already spent stay spent,
-// because the action they paid for already ran. The difference between the
-// amount and what was taken is the shortfall the business absorbs, and the
-// caller is told so it can record it. Bonus credits are never taken: they
-// were not paid for, so a refund does not reach them.
+// It takes what is left in the purchased bucket first, then the purchased
+// share of holds still in flight: the money for those credits went back to
+// the customer, so a release must not return them. Each hold it reaches
+// records the part taken in Hold.Reversed. Credits already spent stay spent,
+// because the action they paid for already ran; the difference between the
+// amount and what was taken is the shortfall the business absorbs, recorded
+// on the entry (Entry.Short). Bonus credits are never taken: they were not
+// paid for, so a refund does not reach them.
+//
+// With Exact, the purchased bucket alone must cover the amount, or nothing
+// is taken and an *InsufficientError is returned.
 //
 // A repeated call with the same key takes nothing and returns what the first
 // call took.
@@ -401,8 +430,8 @@ func (l *Ledger) Reverse(ctx context.Context, account string, r Reversal) (int64
 	if err := checkKey(r.Key); err != nil {
 		return 0, err
 	}
-	if r.Amount <= 0 {
-		return 0, invalid("reversal amount must be positive, got %d", r.Amount)
+	if err := checkAmount("reversal", r.Amount); err != nil {
+		return 0, err
 	}
 	var taken int64
 	err := l.update(ctx, account, func(u *unit) error {
@@ -411,28 +440,45 @@ func (l *Ledger) Reverse(ctx context.Context, account string, r Reversal) (int64
 			return err
 		}
 		if ok {
-			if e.Kind != KindReverse || e.Ref != r.Ref {
+			if e.Kind != KindReverse || e.Requested != r.Amount || e.Ref != r.Ref {
 				return fmt.Errorf("%w: %q", ErrKeyReused, r.Key)
 			}
-			taken = -e.Purchased
+			taken = e.Taken()
 			return nil
 		}
-		taken = min(u.w.Purchased, r.Amount)
-		note := r.Note
-		if taken < r.Amount {
-			short := fmt.Sprintf("short by %d", r.Amount-taken)
-			if note == "" {
-				note = short
-			} else {
-				note += " (" + short + ")"
+
+		fromWallet := min(u.w.Purchased, r.Amount)
+		if r.Exact && fromWallet < r.Amount {
+			return &InsufficientError{Required: r.Amount, Available: u.w.Purchased}
+		}
+		var fromHolds int64
+		if fromWallet < r.Amount {
+			held, err := u.v.Held(u.ctx)
+			if err != nil {
+				return err
+			}
+			for _, h := range held {
+				n := min(r.Amount-fromWallet-fromHolds, h.FromPurchased-h.Reversed)
+				if n <= 0 {
+					continue
+				}
+				h.Reversed += n
+				fromHolds += n
+				u.holds = append(u.holds, h)
+				if fromWallet+fromHolds == r.Amount {
+					break
+				}
 			}
 		}
+		taken = fromWallet + fromHolds
 		return u.move(Entry{
 			Kind:      KindReverse,
 			Key:       r.Key,
-			Purchased: -taken,
+			Purchased: -fromWallet,
+			Requested: r.Amount,
+			FromHolds: fromHolds,
 			Ref:       r.Ref,
-			Note:      note,
+			Note:      r.Note,
 		})
 	})
 	if err != nil {
@@ -450,6 +496,9 @@ func (l *Ledger) Adjust(ctx context.Context, account string, a Adjustment) error
 	}
 	if a.Bonus == 0 && a.Purchased == 0 {
 		return invalid("adjustment changes nothing")
+	}
+	if a.Bonus < -MaxAmount || a.Bonus > MaxAmount || a.Purchased < -MaxAmount || a.Purchased > MaxAmount {
+		return invalid("adjustment beyond MaxAmount")
 	}
 	return l.update(ctx, account, func(u *unit) error {
 		done, err := u.replay(a.Key, func(e Entry) bool {
@@ -490,9 +539,14 @@ func (l *Ledger) Adjust(ctx context.Context, account string, a Adjustment) error
 // maxAge - left behind by a process that died between the hold and its
 // settlement - and returns how many it released.
 //
+// A hold that fails to release does not stop the others: the sweep goes on,
+// and the failures come back joined in the error, next to the count of the
+// holds it did release. Only a cancelled context stops it early.
+//
 // Run it from a periodic worker, with maxAge comfortably longer than the
-// slowest action: an action that finishes after its hold was released gets
-// ErrReleased from Capture.
+// slowest action and than the time a failed Capture is retried: an action
+// that finishes after its hold was released gets ErrReleased from Capture,
+// and has run unpaid.
 func (l *Ledger) ReleaseStale(ctx context.Context, maxAge time.Duration, limit int) (int, error) {
 	if maxAge <= 0 {
 		return 0, invalid("max age must be positive")
@@ -500,21 +554,27 @@ func (l *Ledger) ReleaseStale(ctx context.Context, maxAge time.Duration, limit i
 	if limit <= 0 {
 		limit = defaultPage
 	}
+	limit = min(limit, maxPage)
 	holds, err := l.store.StaleHolds(ctx, l.now().Add(-maxAge), limit)
 	if err != nil {
 		return 0, err
 	}
 	released := 0
+	var errs []error
 	for _, h := range holds {
+		if err := ctx.Err(); err != nil {
+			return released, errors.Join(append(errs, err)...)
+		}
 		changed, err := l.settle(ctx, h.Account, h.ID, HoldReleased)
 		if err != nil {
-			return released, err
+			errs = append(errs, fmt.Errorf("hold %q of %q: %w", h.ID, h.Account, err))
+			continue
 		}
 		if changed {
 			released++
 		}
 	}
-	return released, nil
+	return released, errors.Join(errs...)
 }
 
 // Entries returns up to limit entries of the account, newest first, whose
@@ -536,6 +596,12 @@ func (l *Ledger) Entries(ctx context.Context, account string, before int64, limi
 // before it plus the movement, no balance below zero, and the last one equal
 // to the wallet. A discrepancy is returned wrapped in ErrCorrupt.
 //
+// It takes no lock. The wallet is read first, and only the entries up to its
+// Seq are checked: the history is append-only, so those never change, and a
+// movement made while the audit runs cannot make a healthy account look
+// broken. It walks the history from the newest entry back, a page at a time,
+// so a long history is not held in memory.
+//
 // It reads every entry of the account, so it belongs in a reconciliation job
 // or an operator's tool, not in a request.
 func (l *Ledger) Audit(ctx context.Context, account string) error {
@@ -546,40 +612,63 @@ func (l *Ledger) Audit(ctx context.Context, account string) error {
 	if err != nil {
 		return err
 	}
-	var all []Entry
-	before := int64(0)
-	for {
+
+	// Walking back, each entry must record the balances the newer entries
+	// leave, and taking its movement away must give the balances of the
+	// entry before it. The history starts from an empty wallet at Seq 0.
+	seq, bonus, purchased := w.Seq, w.Bonus, w.Purchased
+	before := w.Seq + 1
+	for seq > 0 {
 		page, err := l.store.Entries(ctx, account, before, maxPage)
 		if err != nil {
 			return err
 		}
-		all = append(all, page...)
-		if len(page) < maxPage {
+		if len(page) == 0 {
 			break
+		}
+		for _, e := range page {
+			if e.Seq != seq {
+				return fmt.Errorf("%w: expected entry %d, found %d", ErrCorrupt, seq, e.Seq)
+			}
+			if e.BonusAfter != bonus || e.PurchasedAfter != purchased {
+				return fmt.Errorf("%w: entry %d records %d/%d, the wallet and the entries after it say %d/%d",
+					ErrCorrupt, e.Seq, e.BonusAfter, e.PurchasedAfter, bonus, purchased)
+			}
+			if bonus < 0 || purchased < 0 {
+				return fmt.Errorf("%w: entry %d leaves a bucket below zero", ErrCorrupt, e.Seq)
+			}
+			bonus -= e.Bonus
+			purchased -= e.Purchased
+			seq--
+			if seq == 0 {
+				break
+			}
 		}
 		before = page[len(page)-1].Seq
 	}
-
-	var bonus, purchased int64
-	for i := len(all) - 1; i >= 0; i-- {
-		e := all[i]
-		want := int64(len(all) - i)
-		if e.Seq != want {
-			return fmt.Errorf("%w: expected entry %d, found %d", ErrCorrupt, want, e.Seq)
-		}
-		bonus += e.Bonus
-		purchased += e.Purchased
-		if e.BonusAfter != bonus || e.PurchasedAfter != purchased {
-			return fmt.Errorf("%w: entry %d records %d/%d, the movements add up to %d/%d",
-				ErrCorrupt, e.Seq, e.BonusAfter, e.PurchasedAfter, bonus, purchased)
-		}
-		if bonus < 0 || purchased < 0 {
-			return fmt.Errorf("%w: entry %d takes a bucket below zero", ErrCorrupt, e.Seq)
-		}
+	if seq != 0 {
+		return fmt.Errorf("%w: the wallet is at entry %d, entries 1 to %d are missing", ErrCorrupt, w.Seq, seq)
 	}
-	if w.Seq != int64(len(all)) || w.Bonus != bonus || w.Purchased != purchased {
-		return fmt.Errorf("%w: wallet holds %d/%d at entry %d, the history adds up to %d/%d at entry %d",
-			ErrCorrupt, w.Bonus, w.Purchased, w.Seq, bonus, purchased, len(all))
+	if bonus != 0 || purchased != 0 {
+		return fmt.Errorf("%w: the history does not start from an empty wallet: %d/%d before entry 1",
+			ErrCorrupt, bonus, purchased)
+	}
+
+	// An entry newer than the wallet is either a movement made during the
+	// audit or a wallet that missed its update. The store writes both in one
+	// change, so a wallet read after the entry was seen must have caught up.
+	newest, err := l.store.Entries(ctx, account, 0, 1)
+	if err != nil {
+		return err
+	}
+	if len(newest) == 1 && newest[0].Seq > w.Seq {
+		again, err := l.store.Wallet(ctx, account)
+		if err != nil {
+			return err
+		}
+		if again.Seq < newest[0].Seq {
+			return fmt.Errorf("%w: entry %d exists, the wallet is at entry %d", ErrCorrupt, newest[0].Seq, again.Seq)
+		}
 	}
 	return nil
 }
@@ -615,7 +704,7 @@ func (l *Ledger) settle(ctx context.Context, account, holdID string, to HoldStat
 		if to == HoldReleased {
 			en.Kind = KindRelease
 			en.Key = reservedPrefix + "release:" + h.ID
-			en.Bonus, en.Purchased = h.FromBonus, h.FromPurchased
+			en.Bonus, en.Purchased = h.FromBonus, h.FromPurchased-h.Reversed
 			if h.FromBonus > 0 && u.w.BonusExpiresAt.IsZero() {
 				u.w.BonusExpiresAt = u.now.Add(l.grace)
 			}
@@ -672,6 +761,9 @@ func (u *unit) move(e Entry) error {
 	purchased := u.w.Purchased + e.Purchased
 	if bonus < 0 || purchased < 0 {
 		return &InsufficientError{Required: -(e.Bonus + e.Purchased), Available: u.w.Total()}
+	}
+	if bonus > MaxAmount || purchased > MaxAmount {
+		return invalid("a bucket would exceed MaxAmount")
 	}
 	u.w.Bonus, u.w.Purchased = bonus, purchased
 	u.w.Seq++
@@ -750,8 +842,15 @@ func checkCharge(c Charge) error {
 	if err := checkKey(c.Key); err != nil {
 		return err
 	}
-	if c.Amount <= 0 {
-		return invalid("charge amount must be positive, got %d", c.Amount)
+	return checkAmount("charge", c.Amount)
+}
+
+func checkAmount(what string, amount int64) error {
+	switch {
+	case amount <= 0:
+		return invalid("%s amount must be positive, got %d", what, amount)
+	case amount > MaxAmount:
+		return invalid("%s amount %d is beyond MaxAmount", what, amount)
 	}
 	return nil
 }

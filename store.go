@@ -62,6 +62,11 @@ type View interface {
 
 	// Hold finds the account's hold with the given id.
 	Hold(ctx context.Context, id string) (Hold, bool, error)
+
+	// Held returns the account's holds that are still held, oldest first.
+	// A reversal reads them to take back purchased credits that are in
+	// flight; an account rarely has more than a few.
+	Held(ctx context.Context) ([]Hold, error)
 }
 
 // Change is what one Update writes.

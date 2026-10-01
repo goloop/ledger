@@ -14,11 +14,15 @@
 //
 //	// An action that costs 25 credits.
 //	h, err := l.Hold(ctx, "user-42", ledger.Charge{Key: "job-7", Amount: 25_00, Ref: "pdf-to-word"})
-//	if err := run(job); err != nil {
-//	    _ = l.Release(ctx, "user-42", h.ID) // a failure costs nothing
+//	if err != nil {
 //	    return err
 //	}
-//	err = l.Capture(ctx, "user-42", h.ID)
+//	settle := context.WithoutCancel(ctx) // a dropped client must not undo a settlement
+//	if err := run(job); err != nil {
+//	    _ = l.Release(settle, "user-42", h.ID) // a failure costs nothing
+//	    return err
+//	}
+//	err = l.Capture(settle, "user-42", h.ID) // on an error, retry; never release
 //
 // # Two buckets
 //
@@ -46,16 +50,26 @@
 // # Holds
 //
 // Hold takes the price of an action out of the wallet while it runs; Capture
-// makes it final and Release puts it back into the buckets it came from. A
-// hold that is never settled - the process died - is released by
-// ReleaseStale, run from a periodic worker. Spend is a hold and a capture in
-// one step, for an action that cannot fail once it is paid for.
+// makes it final and Release puts it back into the buckets it came from.
+// Release belongs on the path where the action failed, never in a defer: a
+// deferred Release after a Capture that failed gives the action away. A hold
+// that is never settled - the process died - is released by ReleaseStale,
+// run from a periodic worker. Spend is a hold and a capture in one step, for
+// an action that cannot fail once it is paid for.
+//
+// # Reversals
+//
+// Reverse takes purchased credits back after a refund or a chargeback: what
+// is left in the bucket, then the purchased share of holds still in flight,
+// so a failed action cannot bring refunded credits back. What was already
+// spent stays spent, and the entry records the shortfall. Reversal.Exact
+// takes all or nothing, for the withdrawal of an unused pack.
 //
 // # Amounts
 //
-// Amounts are int64 in a unit the application chooses. Hundredths of a
-// credit are recommended: a percentage discount on a one-credit price then
-// still has somewhere to go. The ledger never converts money; the exchange
+// Amounts are int64 in a unit the application chooses, at most MaxAmount.
+// Hundredths of a credit are recommended: a percentage discount on a
+// one-credit price then still has somewhere to go. The ledger never converts money; the exchange
 // rate between a currency and credits belongs to the application, and
 // changing it after credits were sold devalues them.
 //

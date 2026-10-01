@@ -54,6 +54,9 @@ func Store(t *testing.T, newStore NewStore) {
 	t.Run("holds are replaced by id", func(t *testing.T) {
 		checkHoldReplace(t, newStore(t))
 	})
+	t.Run("held lists the account's open holds, oldest first", func(t *testing.T) {
+		checkHeld(t, newStore(t))
+	})
 	t.Run("stale holds", func(t *testing.T) {
 		checkStale(t, newStore(t))
 	})
@@ -144,24 +147,32 @@ func checkWrite(t *testing.T, s ledger.Store) {
 		Account: "a", Seq: 2, Kind: ledger.KindGrant, Key: "k2", Bonus: 5,
 		BonusAfter: 5, PurchasedAfter: 7, Origin: ledger.OriginPlan, Hold: "", Ref: "r", Note: "n", At: base,
 	}
+	e3 := ledger.Entry{
+		Account: "a", Seq: 3, Kind: ledger.KindReverse, Key: "k4", Purchased: -1, Requested: 9, FromHolds: 4,
+		BonusAfter: 5, PurchasedAfter: 6, At: base,
+	}
+	w.Purchased, w.Seq = 6, 3
 	h := ledger.Hold{
-		ID: "h1", Account: "a", Key: "k3", Amount: 3, FromBonus: 2, FromPurchased: 1,
+		ID: "h1", Account: "a", Key: "k3", Amount: 3, FromBonus: 2, FromPurchased: 1, Reversed: 1,
 		Ref: "feature", Status: ledger.HoldHeld, CreatedAt: base,
 	}
-	if err := put(t, s, "a", ledger.Change{Wallet: w, Entries: []ledger.Entry{e1, e2}, Holds: []ledger.Hold{h}}); err != nil {
+	if err := put(t, s, "a", ledger.Change{Wallet: w, Entries: []ledger.Entry{e1, e2, e3}, Holds: []ledger.Hold{h}}); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 
 	got := mustWallet(t, s, "a")
-	if got.Bonus != 5 || got.Purchased != 7 || got.Seq != 2 || !sameTime(got.BonusExpiresAt, exp) || !sameTime(got.UpdatedAt, base) {
+	if got.Bonus != 5 || got.Purchased != 6 || got.Seq != 3 || !sameTime(got.BonusExpiresAt, exp) || !sameTime(got.UpdatedAt, base) {
 		t.Fatalf("the wallet must be stored as given, got %+v want %+v", got, w)
 	}
 
 	es := mustEntries(t, s, "a", 0, 10)
-	if len(es) != 2 {
-		t.Fatalf("both entries of the change must be stored, got %d", len(es))
+	if len(es) != 3 {
+		t.Fatalf("every entry of the change must be stored, got %d", len(es))
 	}
-	g := es[0]
+	if r := es[0]; r.Kind != ledger.KindReverse || r.Requested != 9 || r.FromHolds != 4 || r.Purchased != -1 {
+		t.Fatalf("a reversal entry must keep Requested and FromHolds, got %+v want %+v", r, e3)
+	}
+	g := es[1]
 	if g.Seq != 2 || g.Kind != ledger.KindGrant || g.Key != "k2" || g.Bonus != 5 || g.BonusAfter != 5 ||
 		g.PurchasedAfter != 7 || g.Origin != ledger.OriginPlan || g.Ref != "r" || g.Note != "n" ||
 		g.Account != "a" || !sameTime(g.At, base) {
@@ -169,7 +180,7 @@ func checkWrite(t *testing.T, s ledger.Store) {
 	}
 
 	err := s.Update(ctx, "a", func(v ledger.View) (*ledger.Change, error) {
-		if lw := v.Wallet(); lw.Seq != 2 || lw.Purchased != 7 {
+		if lw := v.Wallet(); lw.Seq != 3 || lw.Purchased != 6 {
 			return nil, fmt.Errorf("the locked wallet must be the stored one, got %+v", lw)
 		}
 		e, ok, err := v.Entry(ctx, "k1")
@@ -177,7 +188,7 @@ func checkWrite(t *testing.T, s ledger.Store) {
 			return nil, fmt.Errorf("View.Entry must find an entry by key, got %+v ok=%v err=%v", e, ok, err)
 		}
 		gh, ok, err := v.Hold(ctx, "h1")
-		if err != nil || !ok || gh.Amount != 3 || gh.FromBonus != 2 || gh.FromPurchased != 1 ||
+		if err != nil || !ok || gh.Amount != 3 || gh.FromBonus != 2 || gh.FromPurchased != 1 || gh.Reversed != 1 ||
 			gh.Status != ledger.HoldHeld || gh.Key != "k3" || gh.Ref != "feature" || !sameTime(gh.CreatedAt, base) ||
 			!gh.SettledAt.IsZero() {
 			return nil, fmt.Errorf("View.Hold must return the hold field for field, got %+v ok=%v err=%v", gh, ok, err)
@@ -222,7 +233,7 @@ func checkDuplicate(t *testing.T, s ledger.Store) {
 	if err := put(t, s, "a", ledger.Change{Wallet: wallet("a", 1, 1), Entries: []ledger.Entry{entry("a", 1, "k1", 1, 1)}}); err != nil {
 		t.Fatal(err)
 	}
-	h := ledger.Hold{ID: "h-dup", Account: "a", Key: "x", Amount: 1, Status: ledger.HoldHeld, CreatedAt: base}
+	h := ledger.Hold{ID: "h-dup", Account: "a", Key: "x", Amount: 1, FromPurchased: 1, Status: ledger.HoldHeld, CreatedAt: base}
 	err := put(t, s, "a", ledger.Change{
 		Wallet:  wallet("a", 3, 3),
 		Entries: []ledger.Entry{entry("a", 2, "k2", 1, 2), entry("a", 3, "k1", 1, 3)},
@@ -259,7 +270,7 @@ func checkSeparate(t *testing.T, s ledger.Store) {
 		err := put(t, s, acc, ledger.Change{
 			Wallet:  wallet(acc, 1, 1),
 			Entries: []ledger.Entry{entry(acc, 1, "shared-key", 1, 1)},
-			Holds:   []ledger.Hold{{ID: "h-" + acc, Account: acc, Key: "x", Amount: 1, Status: ledger.HoldHeld, CreatedAt: base}},
+			Holds:   []ledger.Hold{{ID: "h-" + acc, Account: acc, Key: "x", Amount: 1, FromPurchased: 1, Status: ledger.HoldHeld, CreatedAt: base}},
 		})
 		if err != nil {
 			t.Fatalf("keys are unique per account, so two accounts may use the same one; got %v for %q", err, acc)
@@ -328,9 +339,50 @@ func checkHoldReplace(t *testing.T, s ledger.Store) {
 	})
 }
 
+func checkHeld(t *testing.T, s ledger.Store) {
+	mk := func(acc, id string, age time.Duration, st ledger.HoldStatus) ledger.Hold {
+		return ledger.Hold{ID: id, Account: acc, Key: id, Amount: 2, FromPurchased: 2, Status: st, CreatedAt: base.Add(-age)}
+	}
+	seq := map[string]int64{}
+	add := func(h ledger.Hold) {
+		seq[h.Account]++
+		n := seq[h.Account]
+		if err := put(t, s, h.Account, ledger.Change{
+			Wallet: wallet(h.Account, 0, n), Entries: []ledger.Entry{entry(h.Account, n, fmt.Sprint(h.ID, "-", n), 0, 0)}, Holds: []ledger.Hold{h},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add(mk("a", "new", time.Minute, ledger.HoldHeld))
+	add(mk("a", "old", time.Hour, ledger.HoldHeld))
+	add(mk("a", "done", 2*time.Hour, ledger.HoldCaptured))
+	add(mk("b", "other", 3*time.Hour, ledger.HoldHeld))
+	old := mk("a", "old", time.Hour, ledger.HoldHeld)
+	old.Reversed = 2
+	add(old)
+
+	err := s.Update(ctx, "a", func(v ledger.View) (*ledger.Change, error) {
+		hs, err := v.Held(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(hs) != 2 || hs[0].ID != "old" || hs[1].ID != "new" {
+			return nil, fmt.Errorf("View.Held must return the account's held holds, oldest first: want [old new], got %v; "+
+				"a reversal reads it to take back credits in flight", holdIDs(hs))
+		}
+		if hs[0].Reversed != 2 || hs[0].Account != "a" {
+			return nil, fmt.Errorf("View.Held must return holds field for field, as last replaced; got %+v", hs[0])
+		}
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func checkStale(t *testing.T, s ledger.Store) {
 	mk := func(acc, id string, age time.Duration, st ledger.HoldStatus) ledger.Hold {
-		return ledger.Hold{ID: id, Account: acc, Key: id, Amount: 1, Status: st, CreatedAt: base.Add(-age)}
+		return ledger.Hold{ID: id, Account: acc, Key: id, Amount: 1, FromPurchased: 1, Status: st, CreatedAt: base.Add(-age)}
 	}
 	seq := map[string]int64{}
 	add := func(h ledger.Hold) {
@@ -441,14 +493,26 @@ func checkLedger(t *testing.T, s ledger.Store) {
 	if err := l.Spend(ctx, "a", ledger.Charge{Key: "job-3", Amount: 100}); err != nil {
 		t.Fatalf("Spend: %v", err)
 	}
+	h4, err := l.Hold(ctx, "a", ledger.Charge{Key: "job-4", Amount: 650})
+	if err != nil {
+		t.Fatalf("Hold: %v", err)
+	}
+	taken, err := l.Reverse(ctx, "a", ledger.Reversal{Key: "adj_1", Amount: 200, Ref: "txn_1"})
+	if err != nil || taken != 200 {
+		t.Fatalf("a reversal must reach the credits in a hold: want 200, got %d, %v", taken, err)
+	}
+	if err := l.Release(ctx, "a", h4.ID); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
 	w, err := l.Balance(ctx, "a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// 300 bonus + 1000 purchased; 500 captured (300 bonus, 200 purchased);
-	// 100 held and released; the empty bonus expires; 100 spent.
-	if w.Bonus != 0 || w.Purchased != 700 {
-		t.Fatalf("after the scenario the wallet must hold 0/700, got %d/%d", w.Bonus, w.Purchased)
+	// 100 held and released; the empty bonus expires; 100 spent; 650 held,
+	// 200 of them reversed, 450 released.
+	if w.Bonus != 0 || w.Purchased != 500 {
+		t.Fatalf("after the scenario the wallet must hold 0/500, got %d/%d", w.Bonus, w.Purchased)
 	}
 	if err := l.Audit(ctx, "a"); err != nil {
 		t.Fatalf("the history must add up: %v", err)
