@@ -3,7 +3,10 @@ package ledger_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -56,8 +59,7 @@ func TestReverseThenCapture(t *testing.T) {
 		t.Fatalf("want 40 from the hold, got %d", taken)
 	}
 	h2, err := l.Hold(ctx, "a", ledger.Charge{Key: "job", Amount: 100})
-	mustOK(t, err)
-	if h2.ID != h.ID || h2.Reversed != 40 {
+	if !errors.Is(err, ledger.ErrHoldExists) || h2.ID != h.ID || h2.Reversed != 40 {
 		t.Fatalf("the hold must record what the reversal took, got %+v", h2)
 	}
 	// The action ran: the hold is spent as it is, nothing comes back.
@@ -305,11 +307,11 @@ func (s *brokenStore) Entries(c context.Context, account string, before int64, l
 	return s.MemoryStore.Entries(c, account, before, limit)
 }
 
-func (s *brokenStore) StaleHolds(c context.Context, before time.Time, limit int) ([]ledger.Hold, error) {
+func (s *brokenStore) StaleHolds(c context.Context, q ledger.StaleQuery) ([]ledger.Hold, error) {
 	if s.what == "stale" {
 		return nil, errDB
 	}
-	return s.MemoryStore.StaleHolds(c, before, limit)
+	return s.MemoryStore.StaleHolds(c, q)
 }
 
 func (s *brokenStore) Update(c context.Context, account string, fn func(ledger.View) (*ledger.Change, error)) error {
@@ -401,4 +403,132 @@ func TestHoldReplayOfMissingHoldIsCorrupt(t *testing.T) {
 	if _, err := l.Hold(ctx, "a", ledger.Charge{Key: "job", Amount: 1, Ref: "other"}); !errors.Is(err, ledger.ErrKeyReused) {
 		t.Fatalf("got %v", err)
 	}
+}
+
+func TestHoldRunsTheActionOnce(t *testing.T) {
+	l, _, _ := newLedger(t)
+	mustOK(t, l.Deposit(ctx, "a", ledger.Deposit{Key: "d", Amount: 100}))
+
+	// Twenty workers pick up the same job at once: one gets the hold, the
+	// others are told it exists, and the action runs once.
+	var runs, exists atomic.Int64
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := l.Hold(ctx, "a", ledger.Charge{Key: "job", Amount: 40})
+			switch {
+			case err == nil:
+				runs.Add(1)
+			case errors.Is(err, ledger.ErrHoldExists):
+				exists.Add(1)
+			default:
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if runs.Load() != 1 || exists.Load() != 19 {
+		t.Fatalf("the action must run once: %d runs, %d told the hold exists", runs.Load(), exists.Load())
+	}
+	want(t, l, "a", 0, 60)
+}
+
+func TestReverseReplayComparesExact(t *testing.T) {
+	l, _, _ := newLedger(t)
+	mustOK(t, l.Deposit(ctx, "a", ledger.Deposit{Key: "d", Amount: 100}))
+	taken, err := l.Reverse(ctx, "a", ledger.Reversal{Key: "r", Amount: 200})
+	mustOK(t, err)
+	if taken != 100 {
+		t.Fatalf("want 100, got %d", taken)
+	}
+	if _, err := l.Reverse(ctx, "a", ledger.Reversal{Key: "r", Amount: 200, Exact: true}); !errors.Is(err, ledger.ErrKeyReused) {
+		t.Fatalf("a repeated reversal with another mode must be refused, not read as an exact one; got %v", err)
+	}
+	if e := entries(t, l, "a")[0]; e.Exact {
+		t.Fatal("the entry records the mode of the first call")
+	}
+}
+
+func TestReplaceEndsTheHeldBonus(t *testing.T) {
+	l, _, _ := newLedger(t)
+	mustOK(t, l.Grant(ctx, "a", ledger.Grant{Key: "p1", Amount: 100, Until: t0.Add(24 * time.Hour), Origin: ledger.OriginPlan}))
+	mustOK(t, l.Deposit(ctx, "a", ledger.Deposit{Key: "d", Amount: 10}))
+	old, err := l.Hold(ctx, "a", ledger.Charge{Key: "job-1", Amount: 110}) // 100 bonus + 10 purchased
+	mustOK(t, err)
+	mustOK(t, l.Grant(ctx, "a", ledger.Grant{
+		Key: "p2", Amount: 100, Until: t0.Add(48 * time.Hour), Replace: true, Origin: ledger.OriginPlan,
+	}))
+	fresh, err := l.Hold(ctx, "a", ledger.Charge{Key: "job-2", Amount: 30})
+	mustOK(t, err)
+
+	mustOK(t, l.Release(ctx, "a", old.ID))
+	want(t, l, "a", 70, 10) // the old period's 100 bonus are written off, the 10 purchased come back
+	es := entries(t, l, "a")
+	if es[0].Kind != ledger.KindExpire || es[0].Bonus != -100 || es[0].Hold != old.ID || es[1].Kind != ledger.KindRelease {
+		t.Fatalf("a release after a replacement must record the write-off after the release, got %+v %+v", es[0], es[1])
+	}
+
+	mustOK(t, l.Release(ctx, "a", fresh.ID))
+	want(t, l, "a", 100, 10) // a hold of the current period comes back whole
+}
+
+// failingAccounts fails every update of the named accounts.
+type failingAccounts struct {
+	*ledger.MemoryStore
+	bad map[string]bool
+}
+
+func (s *failingAccounts) Update(c context.Context, account string, fn func(ledger.View) (*ledger.Change, error)) error {
+	if s.bad[account] {
+		return errors.New("db: row locked")
+	}
+	return s.MemoryStore.Update(c, account, fn)
+}
+
+func TestReleaseStaleWalksPastAFullPageOfFailures(t *testing.T) {
+	s := &failingAccounts{MemoryStore: ledger.NewMemoryStore(), bad: map[string]bool{}}
+	now := t0
+	l := ledger.New(s, ledger.WithClock(func() time.Time { return now }))
+	for _, acc := range []string{"bad-1", "bad-2", "bad-3", "good"} {
+		mustOK(t, l.Deposit(ctx, acc, ledger.Deposit{Key: "d", Amount: 10}))
+		_, err := l.Hold(ctx, acc, ledger.Charge{Key: "h", Amount: 10})
+		mustOK(t, err)
+		now = now.Add(time.Second)
+	}
+	now = now.Add(time.Hour)
+	s.bad = map[string]bool{"bad-1": true, "bad-2": true, "bad-3": true}
+
+	for _, limit := range []int{1, 3} {
+		n, err := l.ReleaseStale(ctx, time.Minute, limit)
+		if n != 1 || err == nil {
+			t.Fatalf("limit %d: the oldest holds failing must not keep the sweep from the healthy one: "+
+				"want 1 released and an error, got %d, %v", limit, n, err)
+		}
+		if strings.Count(err.Error(), "row locked") != 3 {
+			t.Fatalf("every failure is reported, got %v", err)
+		}
+		want(t, l, "good", 0, 10)
+		// Make the healthy hold stale again for the second limit.
+		_, err = l.Hold(ctx, "good", ledger.Charge{Key: fmt.Sprint("h", limit), Amount: 10})
+		mustOK(t, err)
+		now = now.Add(time.Hour)
+	}
+}
+
+// One refund applied by both paths - the withdrawal the application started
+// and the provider's webhook - under the record's key is reversed once.
+func TestOneRefundOneReversal(t *testing.T) {
+	l, _, _ := newLedger(t)
+	mustOK(t, l.Deposit(ctx, "a", ledger.Deposit{Key: "txn_1", Amount: 100}))
+	mustOK(t, l.Deposit(ctx, "a", ledger.Deposit{Key: "txn_2", Amount: 100}))
+
+	stored := ledger.Reversal{Key: "refund:r1", Amount: 100, Ref: "txn_1", Exact: true}
+	for _, path := range []string{"withdrawal", "webhook", "webhook again"} {
+		if _, err := l.Reverse(ctx, "a", stored); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+	}
+	want(t, l, "a", 0, 100)
 }

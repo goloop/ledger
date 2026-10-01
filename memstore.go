@@ -5,7 +5,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 )
 
 // MemoryStore is a Store held in memory. It is the reference implementation
@@ -107,20 +106,25 @@ func (s *MemoryStore) Entries(_ context.Context, account string, before int64, l
 }
 
 // StaleHolds implements Store.
-func (s *MemoryStore) StaleHolds(_ context.Context, createdBefore time.Time, limit int) ([]Hold, error) {
+func (s *MemoryStore) StaleHolds(_ context.Context, q StaleQuery) ([]Hold, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	after := Hold{CreatedAt: q.AfterCreated, ID: q.AfterID}
 	var out []Hold
 	for _, byID := range s.holds {
 		for _, h := range byID {
-			if h.Status == HoldHeld && h.CreatedAt.Before(createdBefore) {
-				out = append(out, h)
+			if h.Status != HoldHeld || !h.CreatedAt.Before(q.CreatedBefore) {
+				continue
 			}
+			if q.AfterID != "" && compareHolds(h, after) <= 0 {
+				continue
+			}
+			out = append(out, h)
 		}
 	}
 	slices.SortFunc(out, compareHolds)
-	if len(out) > limit {
-		out = out[:limit]
+	if len(out) > max(q.Limit, 0) {
+		out = out[:max(q.Limit, 0)]
 	}
 	return out, nil
 }

@@ -40,11 +40,12 @@ func ExampleLedger_Hold() {
 
 	h, err := l.Hold(ctx, "user-42", ledger.Charge{Key: "job-8", Amount: 40})
 	if err != nil {
-		return
+		return // ErrHoldExists: the job already has a hold, do not run it twice
 	}
-	// Settle on a context the client cannot cancel: once the action ran,
-	// a dropped connection must not undo its payment.
-	settle := context.WithoutCancel(ctx)
+	// Settle on a context the client cannot cancel, with its own deadline:
+	// once the action ran, a dropped connection must not undo its payment.
+	settle, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
 	if err := convert(); err != nil {
 		_ = l.Release(settle, "user-42", h.ID) // a failure costs nothing
 		return
@@ -55,9 +56,15 @@ func ExampleLedger_Hold() {
 		return
 	}
 
+	// The same job again, from a retry or a second worker: it is not run.
+	_, err = l.Hold(ctx, "user-42", ledger.Charge{Key: "job-8", Amount: 40})
+	fmt.Println(errors.Is(err, ledger.ErrHoldExists), errors.Is(err, ledger.ErrCaptured))
+
 	w, _ := l.Balance(ctx, "user-42")
 	fmt.Println(w.Purchased)
-	// Output: 60
+	// Output:
+	// true true
+	// 60
 }
 
 func convert() error { return nil }
@@ -111,7 +118,9 @@ func ExampleReversal_exact() {
 	_ = l.Deposit(ctx, "user-42", ledger.Deposit{Key: "txn_01", Amount: 1000})
 	_ = l.Spend(ctx, "user-42", ledger.Charge{Key: "job-1", Amount: 1})
 
-	// The withdrawal of an unused pack: all of it, or nothing.
+	// All of the pack's credits from the free purchased ones, or nothing.
+	// It checks the balance, not the pack's own history: whether the pack
+	// is unused is decided from the application's records.
 	_, err := l.Reverse(ctx, "user-42", ledger.Reversal{
 		Key: "withdraw:p-1", Amount: 1000, Ref: "txn_01", Exact: true,
 	})

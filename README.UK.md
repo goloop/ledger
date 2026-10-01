@@ -84,15 +84,17 @@ if errors.Is(err, ledger.ErrInsufficient) {
 	return errPaymentRequired // 402
 }
 if err != nil {
-	return err
+	return err // ErrHoldExists: у задачі вже є резерв - не запускати вдруге
 }
-settle := context.WithoutCancel(ctx) // клієнт, що відключився, не скасовує розрахунок
+// Розрахунок - на контексті, який клієнт не скасує, з власним строком.
+settle, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+defer cancel()
 if err := run(job); err != nil {
 	_ = l.Release(settle, "user-42", h.ID) // невдача нічого не коштує
 	return err
 }
-// Дія виконана: на помилці Capture - повторити. Не звільняти тут і не
-// відкладати Release через defer - це подарувало б дію.
+// Дія виконана: на помилці Capture його повторить воркер. Не звільняти тут
+// і не відкладати Release через defer - це подарувало б дію.
 err = l.Capture(settle, "user-42", h.ID)
 ```
 
@@ -171,10 +173,13 @@ func handle(ctx context.Context, ev *paddle.Event) error {
 		if err != nil {
 			return err
 		}
-		// id adjustment - це ключ: можуть прийти і created, і updated.
-		_, err = l.Reverse(ctx, p.Account, ledger.Reversal{
-			Key: adj.ID, Amount: p.Credits, Ref: adj.TransactionID,
-		})
+		// Одне повернення - один запис, один ключ, спільний із відмовою, яку
+		// почав застосунок, тож повернення ніколи не сторнується двічі.
+		r, err := refunds.ForProvider(ctx, p, adj.ID) // ваша таблиця
+		if err != nil {
+			return err
+		}
+		_, err = l.Reverse(ctx, p.Account, r.Reversal()) // "refund:" + r.ID
 		return err
 	}
 	return nil

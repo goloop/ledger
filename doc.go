@@ -15,9 +15,10 @@
 //	// An action that costs 25 credits.
 //	h, err := l.Hold(ctx, "user-42", ledger.Charge{Key: "job-7", Amount: 25_00, Ref: "pdf-to-word"})
 //	if err != nil {
-//	    return err
+//	    return err // ErrHoldExists: this job already has a hold, do not run it twice
 //	}
-//	settle := context.WithoutCancel(ctx) // a dropped client must not undo a settlement
+//	settle, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+//	defer cancel()
 //	if err := run(job); err != nil {
 //	    _ = l.Release(settle, "user-42", h.ID) // a failure costs nothing
 //	    return err
@@ -51,8 +52,10 @@
 //
 // Hold takes the price of an action out of the wallet while it runs; Capture
 // makes it final and Release puts it back into the buckets it came from.
-// Release belongs on the path where the action failed, never in a defer: a
-// deferred Release after a Capture that failed gives the action away. A hold
+// Only the call that makes a hold gets no error; a repeat with the same key
+// gets the hold back with ErrHoldExists, so the action runs once. Release
+// belongs on the path where the action failed, never in a defer: a deferred
+// Release after a Capture that failed gives the action away. A hold
 // that is never settled - the process died - is released by ReleaseStale,
 // run from a periodic worker. Spend is a hold and a capture in one step, for
 // an action that cannot fail once it is paid for.
@@ -63,7 +66,9 @@
 // is left in the bucket, then the purchased share of holds still in flight,
 // so a failed action cannot bring refunded credits back. What was already
 // spent stays spent, and the entry records the shortfall. Reversal.Exact
-// takes all or nothing, for the withdrawal of an unused pack.
+// takes all or nothing from the free purchased credits. One refund is one
+// reversal under one key, whichever path - a withdrawal or a webhook -
+// applies it.
 //
 // # Amounts
 //

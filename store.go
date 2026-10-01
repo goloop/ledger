@@ -47,9 +47,26 @@ type Store interface {
 	// whose Seq is below before. before <= 0 means from the newest.
 	Entries(ctx context.Context, account string, before int64, limit int) ([]Entry, error)
 
-	// StaleHolds returns up to limit holds, of any account, that are still
-	// held and were created before the given time, oldest first.
-	StaleHolds(ctx context.Context, createdBefore time.Time, limit int) ([]Hold, error)
+	// StaleHolds returns up to q.Limit holds, of any account, that are still
+	// held and were created before q.CreatedBefore, ordered by CreatedAt
+	// and then ID. With q.AfterID set it returns only the holds after
+	// (q.AfterCreated, q.AfterID) in that order, so a walk can go past holds
+	// that keep failing instead of reading them again.
+	StaleHolds(ctx context.Context, q StaleQuery) ([]Hold, error)
+}
+
+// StaleQuery selects the holds StaleHolds returns.
+type StaleQuery struct {
+	// CreatedBefore keeps the holds created before it.
+	CreatedBefore time.Time
+
+	// AfterCreated and AfterID continue a walk from the last hold of the
+	// previous page; an empty AfterID starts from the oldest.
+	AfterCreated time.Time
+	AfterID      string
+
+	// Limit is the most holds to return.
+	Limit int
 }
 
 // View is the locked state of one account inside Store.Update.

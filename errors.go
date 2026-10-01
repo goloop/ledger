@@ -25,6 +25,17 @@ var (
 	// again or let it go.
 	ErrReleased = errors.New("ledger: hold already released")
 
+	// ErrHoldExists is returned by Hold when a hold with the key already
+	// exists: only the call that made a hold gets no error, so the action it
+	// pays for runs once however many times - or however many workers at
+	// once - the request is repeated. The hold comes back with the error.
+	// A captured hold matches ErrCaptured too, a released one ErrReleased.
+	ErrHoldExists = errors.New("ledger: hold already exists")
+
+	// ErrCaptured is returned, with ErrHoldExists, by Hold for a key whose
+	// hold was captured: the action was paid for and ran.
+	ErrCaptured = errors.New("ledger: hold already captured")
+
 	// ErrKeyReused reports a key that the account already used for a
 	// different movement: another kind, another amount, another hold. A
 	// retry must repeat the request exactly; a new request needs a new key.

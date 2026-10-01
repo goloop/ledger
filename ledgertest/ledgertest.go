@@ -141,19 +141,19 @@ func checkUnknown(t *testing.T, s ledger.Store) {
 
 func checkWrite(t *testing.T, s ledger.Store) {
 	exp := base.Add(30 * 24 * time.Hour)
-	w := ledger.Wallet{Account: "a", Bonus: 5, Purchased: 7, BonusExpiresAt: exp, Seq: 2, UpdatedAt: base}
+	w := ledger.Wallet{Account: "a", Bonus: 5, Purchased: 7, BonusExpiresAt: exp, BonusPeriod: 3, Seq: 2, UpdatedAt: base}
 	e1 := entry("a", 1, "k1", 7, 7)
 	e2 := ledger.Entry{
 		Account: "a", Seq: 2, Kind: ledger.KindGrant, Key: "k2", Bonus: 5,
 		BonusAfter: 5, PurchasedAfter: 7, Origin: ledger.OriginPlan, Hold: "", Ref: "r", Note: "n", At: base,
 	}
 	e3 := ledger.Entry{
-		Account: "a", Seq: 3, Kind: ledger.KindReverse, Key: "k4", Purchased: -1, Requested: 9, FromHolds: 4,
+		Account: "a", Seq: 3, Kind: ledger.KindReverse, Key: "k4", Purchased: -1, Requested: 9, FromHolds: 4, Exact: true,
 		BonusAfter: 5, PurchasedAfter: 6, At: base,
 	}
 	w.Purchased, w.Seq = 6, 3
 	h := ledger.Hold{
-		ID: "h1", Account: "a", Key: "k3", Amount: 3, FromBonus: 2, FromPurchased: 1, Reversed: 1,
+		ID: "h1", Account: "a", Key: "k3", Amount: 3, FromBonus: 2, FromPurchased: 1, Reversed: 1, BonusPeriod: 3,
 		Ref: "feature", Status: ledger.HoldHeld, CreatedAt: base,
 	}
 	if err := put(t, s, "a", ledger.Change{Wallet: w, Entries: []ledger.Entry{e1, e2, e3}, Holds: []ledger.Hold{h}}); err != nil {
@@ -161,7 +161,7 @@ func checkWrite(t *testing.T, s ledger.Store) {
 	}
 
 	got := mustWallet(t, s, "a")
-	if got.Bonus != 5 || got.Purchased != 6 || got.Seq != 3 || !sameTime(got.BonusExpiresAt, exp) || !sameTime(got.UpdatedAt, base) {
+	if got.Bonus != 5 || got.Purchased != 6 || got.Seq != 3 || got.BonusPeriod != 3 || !sameTime(got.BonusExpiresAt, exp) || !sameTime(got.UpdatedAt, base) {
 		t.Fatalf("the wallet must be stored as given, got %+v want %+v", got, w)
 	}
 
@@ -169,8 +169,8 @@ func checkWrite(t *testing.T, s ledger.Store) {
 	if len(es) != 3 {
 		t.Fatalf("every entry of the change must be stored, got %d", len(es))
 	}
-	if r := es[0]; r.Kind != ledger.KindReverse || r.Requested != 9 || r.FromHolds != 4 || r.Purchased != -1 {
-		t.Fatalf("a reversal entry must keep Requested and FromHolds, got %+v want %+v", r, e3)
+	if r := es[0]; r.Kind != ledger.KindReverse || r.Requested != 9 || r.FromHolds != 4 || r.Purchased != -1 || !r.Exact {
+		t.Fatalf("a reversal entry must keep Requested, FromHolds and Exact, got %+v want %+v", r, e3)
 	}
 	g := es[1]
 	if g.Seq != 2 || g.Kind != ledger.KindGrant || g.Key != "k2" || g.Bonus != 5 || g.BonusAfter != 5 ||
@@ -188,7 +188,7 @@ func checkWrite(t *testing.T, s ledger.Store) {
 			return nil, fmt.Errorf("View.Entry must find an entry by key, got %+v ok=%v err=%v", e, ok, err)
 		}
 		gh, ok, err := v.Hold(ctx, "h1")
-		if err != nil || !ok || gh.Amount != 3 || gh.FromBonus != 2 || gh.FromPurchased != 1 || gh.Reversed != 1 ||
+		if err != nil || !ok || gh.Amount != 3 || gh.FromBonus != 2 || gh.FromPurchased != 1 || gh.Reversed != 1 || gh.BonusPeriod != 3 ||
 			gh.Status != ledger.HoldHeld || gh.Key != "k3" || gh.Ref != "feature" || !sameTime(gh.CreatedAt, base) ||
 			!gh.SettledAt.IsZero() {
 			return nil, fmt.Errorf("View.Hold must return the hold field for field, got %+v ok=%v err=%v", gh, ok, err)
@@ -400,7 +400,7 @@ func checkStale(t *testing.T, s ledger.Store) {
 	add(mk("b", "settled", 5*time.Hour, ledger.HoldCaptured))
 	add(mk("a", "released", 5*time.Hour, ledger.HoldReleased))
 
-	got, err := s.StaleHolds(ctx, base.Add(-time.Hour), 10)
+	got, err := s.StaleHolds(ctx, ledger.StaleQuery{CreatedBefore: base.Add(-time.Hour), Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,8 +411,29 @@ func checkStale(t *testing.T, s ledger.Store) {
 	if got[0].Account != "b" {
 		t.Fatalf("a stale hold must carry its account, or it cannot be released; got %q", got[0].Account)
 	}
-	if one, _ := s.StaleHolds(ctx, base.Add(-time.Hour), 1); len(one) != 1 || one[0].ID != "older" {
+	one, _ := s.StaleHolds(ctx, ledger.StaleQuery{CreatedBefore: base.Add(-time.Hour), Limit: 1})
+	if len(one) != 1 || one[0].ID != "older" {
 		t.Fatalf("StaleHolds must honour the limit and keep the oldest, got %v", holdIDs(one))
+	}
+	next, _ := s.StaleHolds(ctx, ledger.StaleQuery{
+		CreatedBefore: base.Add(-time.Hour), AfterCreated: one[0].CreatedAt, AfterID: one[0].ID, Limit: 10,
+	})
+	if len(next) != 1 || next[0].ID != "old" {
+		t.Fatalf("StaleHolds must continue after (AfterCreated, AfterID), so a sweep can go past holds that "+
+			"keep failing: want [old], got %v", holdIDs(next))
+	}
+
+	// Two holds created at the same instant are ordered by id, and the walk
+	// goes from one to the other.
+	add(mk("c", "tie-b", 6*time.Hour, ledger.HoldHeld))
+	add(mk("c", "tie-a", 6*time.Hour, ledger.HoldHeld))
+	first, _ := s.StaleHolds(ctx, ledger.StaleQuery{CreatedBefore: base.Add(-time.Hour), Limit: 1})
+	rest, _ := s.StaleHolds(ctx, ledger.StaleQuery{
+		CreatedBefore: base.Add(-time.Hour), AfterCreated: first[0].CreatedAt, AfterID: first[0].ID, Limit: 1,
+	})
+	if len(first) != 1 || first[0].ID != "tie-a" || len(rest) != 1 || rest[0].ID != "tie-b" {
+		t.Fatalf("holds created at the same instant are ordered by id: want tie-a then tie-b, got %v then %v",
+			holdIDs(first), holdIDs(rest))
 	}
 }
 

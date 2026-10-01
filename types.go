@@ -97,6 +97,12 @@ type Wallet struct {
 	// allowance replaces the previous one instead of adding to it.
 	BonusExpiresAt time.Time
 
+	// BonusPeriod counts the grants that replaced the bucket
+	// (Grant.Replace). A hold remembers the period its bonus credits came
+	// from, so a release after a replacement does not carry the old period's
+	// credits into the new one.
+	BonusPeriod int64
+
 	// Seq is the sequence number of the last entry. Entries of one account
 	// are numbered 1, 2, 3, ... without gaps, which is what lets Audit tell
 	// a missing row from a merely old one.
@@ -171,6 +177,10 @@ type Entry struct {
 	Requested int64
 	FromHolds int64
 
+	// Exact is set on a reversal made with Reversal.Exact, so a repeated
+	// call is compared with the mode as well as the amount.
+	Exact bool
+
 	// Origin is set on grants.
 	Origin Origin
 
@@ -209,6 +219,11 @@ type Hold struct {
 	// hold was in flight: the money for those credits went back to the
 	// customer, so a release returns only FromPurchased - Reversed.
 	Reversed int64
+
+	// BonusPeriod is the wallet's BonusPeriod when the hold was made. A
+	// release in a later period writes the bonus share off instead of
+	// returning it: that period is over.
+	BonusPeriod int64
 
 	// Status is where the hold is; SettledAt is when it was captured or
 	// released, zero while it is held.

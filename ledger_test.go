@@ -207,9 +207,8 @@ func TestHoldCaptureRelease(t *testing.T) {
 	want(t, l, "a", 0, 80)
 
 	again, err := l.Hold(ctx, "a", ledger.Charge{Key: "job-1", Amount: 50, Ref: "pdf"})
-	mustOK(t, err)
-	if again.ID != h.ID {
-		t.Fatalf("a repeated Hold must return the first hold, got %q want %q", again.ID, h.ID)
+	if !errors.Is(err, ledger.ErrHoldExists) || again.ID != h.ID {
+		t.Fatalf("a repeated Hold must return the first hold with ErrHoldExists, got %q, %v", again.ID, err)
 	}
 	if _, err := l.Hold(ctx, "a", ledger.Charge{Key: "job-1", Amount: 60, Ref: "pdf"}); !errors.Is(err, ledger.ErrKeyReused) {
 		t.Fatalf("a repeated Hold with another amount must be refused, got %v", err)
@@ -232,9 +231,9 @@ func TestHoldCaptureRelease(t *testing.T) {
 	want(t, l, "a", 0, 90)
 
 	got, err := l.Hold(ctx, "a", ledger.Charge{Key: "job-2", Amount: 40})
-	mustOK(t, err)
-	if got.Status != ledger.HoldCaptured || got.SettledAt.IsZero() {
-		t.Fatalf("a repeated Hold returns the hold as it is now, got %+v", got)
+	if !errors.Is(err, ledger.ErrHoldExists) || !errors.Is(err, ledger.ErrCaptured) ||
+		got.Status != ledger.HoldCaptured || got.SettledAt.IsZero() {
+		t.Fatalf("a repeated Hold of a captured hold returns it as it is now, with ErrCaptured; got %+v, %v", got, err)
 	}
 
 	if err := l.Capture(ctx, "a", "no-such-hold"); !errors.Is(err, ledger.ErrNotFound) {

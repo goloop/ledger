@@ -85,15 +85,17 @@ if errors.Is(err, ledger.ErrInsufficient) {
 	return errPaymentRequired // 402
 }
 if err != nil {
-	return err
+	return err // ErrHoldExists: this job already has a hold - do not run it twice
 }
-settle := context.WithoutCancel(ctx) // a dropped client must not undo a settlement
+// Settle on a context a dropped client cannot cancel, with its own deadline.
+settle, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+defer cancel()
 if err := run(job); err != nil {
 	_ = l.Release(settle, "user-42", h.ID) // a failure costs nothing
 	return err
 }
-// The action ran: on an error, retry the Capture. Never release here, and
-// never defer the Release - that would give the action away.
+// The action ran: on an error, a worker retries the Capture. Never release
+// here, and never defer the Release - that would give the action away.
 err = l.Capture(settle, "user-42", h.ID)
 ```
 
@@ -173,10 +175,13 @@ func handle(ctx context.Context, ev *paddle.Event) error {
 		if err != nil {
 			return err
 		}
-		// The adjustment id is the key: created and updated may both arrive.
-		_, err = l.Reverse(ctx, p.Account, ledger.Reversal{
-			Key: adj.ID, Amount: p.Credits, Ref: adj.TransactionID,
-		})
+		// One refund, one record, one key - shared with a withdrawal your
+		// application started, so a refund is never reversed twice.
+		r, err := refunds.ForProvider(ctx, p, adj.ID) // your table
+		if err != nil {
+			return err
+		}
+		_, err = l.Reverse(ctx, p.Account, r.Reversal()) // "refund:" + r.ID
 		return err
 	}
 	return nil

@@ -240,6 +240,7 @@ func (l *Ledger) Grant(ctx context.Context, account string, g Grant) error {
 				}
 			}
 			u.w.BonusExpiresAt = g.Until
+			u.w.BonusPeriod++
 		} else {
 			u.extend(g.Until)
 		}
@@ -284,12 +285,14 @@ func (l *Ledger) Deposit(ctx context.Context, account string, d Deposit) error {
 // the hold. The caller captures it when the action succeeds and releases it
 // when the action fails.
 //
-// A repeated call with the same key takes nothing more and returns the hold
-// the first call made. A hold that was released comes back with ErrReleased:
-// the action it paid for must not run on it, and a new attempt needs a new
-// key. A captured one comes back without an error and with Status
-// HoldCaptured, which means the action was already paid for and ran. A wallet
-// that cannot cover the amount returns an *InsufficientError.
+// Only the call that makes the hold gets no error. A repeated call with the
+// same key takes nothing more and returns the existing hold with an error
+// that matches ErrHoldExists - and ErrCaptured when the hold was captured,
+// ErrReleased when it was released. So "if err != nil, do not run the
+// action" is enough to run it once, even when two workers repeat the request
+// at the same moment: the store serializes them and one of them makes the
+// hold. A new attempt after a release needs a new key. A wallet that cannot
+// cover the amount returns an *InsufficientError.
 func (l *Ledger) Hold(ctx context.Context, account string, c Charge) (Hold, error) {
 	if err := checkCharge(c); err != nil {
 		return Hold{}, err
@@ -315,10 +318,13 @@ func (l *Ledger) Hold(ctx context.Context, account string, c Charge) (Hold, erro
 				return fmt.Errorf("%w: %q", ErrKeyReused, c.Key)
 			}
 			out = h
-			if h.Status == HoldReleased {
-				return fmt.Errorf("%w: %q was released, the key %q needs a new attempt", ErrReleased, h.ID, c.Key)
+			switch h.Status {
+			case HoldCaptured:
+				return fmt.Errorf("%w: %w: %q", ErrHoldExists, ErrCaptured, h.ID)
+			case HoldReleased:
+				return fmt.Errorf("%w: %w: %q, the key %q needs a new attempt", ErrHoldExists, ErrReleased, h.ID, c.Key)
 			}
-			return nil
+			return fmt.Errorf("%w: %q is in flight", ErrHoldExists, h.ID)
 		}
 
 		if have := u.w.Total(); have < c.Amount {
@@ -334,6 +340,7 @@ func (l *Ledger) Hold(ctx context.Context, account string, c Charge) (Hold, erro
 			FromPurchased: c.Amount - fromBonus,
 			Ref:           c.Ref,
 			Status:        HoldHeld,
+			BonusPeriod:   u.w.BonusPeriod,
 			CreatedAt:     u.now,
 		}
 		err = u.move(Entry{
@@ -352,7 +359,7 @@ func (l *Ledger) Hold(ctx context.Context, account string, c Charge) (Hold, erro
 		out = h
 		return nil
 	})
-	if errors.Is(err, ErrReleased) {
+	if errors.Is(err, ErrHoldExists) {
 		return out, err
 	}
 	if err != nil {
@@ -440,7 +447,7 @@ func (l *Ledger) Reverse(ctx context.Context, account string, r Reversal) (int64
 			return err
 		}
 		if ok {
-			if e.Kind != KindReverse || e.Requested != r.Amount || e.Ref != r.Ref {
+			if e.Kind != KindReverse || e.Requested != r.Amount || e.Exact != r.Exact || e.Ref != r.Ref {
 				return fmt.Errorf("%w: %q", ErrKeyReused, r.Key)
 			}
 			taken = e.Taken()
@@ -477,6 +484,7 @@ func (l *Ledger) Reverse(ctx context.Context, account string, r Reversal) (int64
 			Purchased: -fromWallet,
 			Requested: r.Amount,
 			FromHolds: fromHolds,
+			Exact:     r.Exact,
 			Ref:       r.Ref,
 			Note:      r.Note,
 		})
@@ -539,14 +547,17 @@ func (l *Ledger) Adjust(ctx context.Context, account string, a Adjustment) error
 // maxAge - left behind by a process that died between the hold and its
 // settlement - and returns how many it released.
 //
-// A hold that fails to release does not stop the others: the sweep goes on,
-// and the failures come back joined in the error, next to the count of the
-// holds it did release. Only a cancelled context stops it early.
+// A hold that fails to release does not stop the others: the sweep walks on
+// past it, page by page in the order StaleHolds gives, until it has released
+// limit holds or has seen every stale one, and the failures come back joined
+// in the error next to the count. A hold that keeps failing therefore never
+// blocks the ones behind it. Only a cancelled context stops the sweep early.
 //
 // Run it from a periodic worker, with maxAge comfortably longer than the
 // slowest action and than the time a failed Capture is retried: an action
 // that finishes after its hold was released gets ErrReleased from Capture,
-// and has run unpaid.
+// and has run unpaid. A hold whose action is known to have run belongs to
+// the settlement retry, not to this sweep.
 func (l *Ledger) ReleaseStale(ctx context.Context, maxAge time.Duration, limit int) (int, error) {
 	if maxAge <= 0 {
 		return 0, invalid("max age must be positive")
@@ -555,24 +566,35 @@ func (l *Ledger) ReleaseStale(ctx context.Context, maxAge time.Duration, limit i
 		limit = defaultPage
 	}
 	limit = min(limit, maxPage)
-	holds, err := l.store.StaleHolds(ctx, l.now().Add(-maxAge), limit)
-	if err != nil {
-		return 0, err
-	}
+	q := StaleQuery{CreatedBefore: l.now().Add(-maxAge), Limit: limit}
 	released := 0
 	var errs []error
-	for _, h := range holds {
-		if err := ctx.Err(); err != nil {
+	for released < limit {
+		holds, err := l.store.StaleHolds(ctx, q)
+		if err != nil {
 			return released, errors.Join(append(errs, err)...)
 		}
-		changed, err := l.settle(ctx, h.Account, h.ID, HoldReleased)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("hold %q of %q: %w", h.ID, h.Account, err))
-			continue
+		for _, h := range holds {
+			if released == limit {
+				break
+			}
+			if err := ctx.Err(); err != nil {
+				return released, errors.Join(append(errs, err)...)
+			}
+			changed, err := l.settle(ctx, h.Account, h.ID, HoldReleased)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("hold %q of %q: %w", h.ID, h.Account, err))
+				continue
+			}
+			if changed {
+				released++
+			}
 		}
-		if changed {
-			released++
+		if len(holds) < q.Limit {
+			break
 		}
+		last := holds[len(holds)-1]
+		q.AfterCreated, q.AfterID = last.CreatedAt, last.ID
 	}
 	return released, errors.Join(errs...)
 }
@@ -701,16 +723,33 @@ func (l *Ledger) settle(ctx context.Context, account, holdID string, to HoldStat
 		h.Status = to
 		h.SettledAt = u.now
 		en := Entry{Kind: KindCapture, Key: reservedPrefix + "capture:" + h.ID, Hold: h.ID, Ref: h.Ref}
+		replaced := false
 		if to == HoldReleased {
 			en.Kind = KindRelease
 			en.Key = reservedPrefix + "release:" + h.ID
 			en.Bonus, en.Purchased = h.FromBonus, h.FromPurchased-h.Reversed
-			if h.FromBonus > 0 && u.w.BonusExpiresAt.IsZero() {
+			replaced = h.FromBonus > 0 && h.BonusPeriod != u.w.BonusPeriod
+			if h.FromBonus > 0 && !replaced && u.w.BonusExpiresAt.IsZero() {
 				u.w.BonusExpiresAt = u.now.Add(l.grace)
 			}
 		}
 		if err := u.move(en); err != nil {
 			return err
+		}
+		if replaced {
+			// The bonus credits came from a period a replacing grant ended:
+			// had they been in the wallet, the grant would have written them
+			// off, so they are written off now.
+			err := u.move(Entry{
+				Kind:  KindExpire,
+				Key:   u.ownKey("expire"),
+				Bonus: -h.FromBonus,
+				Hold:  h.ID,
+				Note:  "bonus of a replaced period",
+			})
+			if err != nil {
+				return err
+			}
 		}
 		u.holds = append(u.holds, h)
 		changed = true
