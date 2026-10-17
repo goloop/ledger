@@ -1,4 +1,4 @@
-[![deps.dev](https://img.shields.io/badge/deps.dev-insights-4c8dbc)](https://deps.dev/go/github.com%2Fgoloop%2Fledger) [![Go Reference](https://img.shields.io/badge/godoc-reference-blue)](https://pkg.go.dev/github.com/goloop/ledger) [![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://github.com/goloop/ledger/blob/master/LICENSE) [![Stay with Ukraine](https://img.shields.io/static/v1?label=Stay%20with&message=Ukraine%20♥&color=ffD700&labelColor=0057B8&style=flat)](https://u24.gov.ua/)
+[![deps.dev](https://img.shields.io/badge/deps.dev-insights-4c8dbc)](https://deps.dev/go/github.com%2Fgoloop%2Fledger) [![Go Reference](https://img.shields.io/badge/godoc-reference-blue)](https://pkg.go.dev/github.com/goloop/ledger) [![License](https://img.shields.io/badge/license-MIT-brightgreen)](https://github.com/goloop/ledger/blob/v1/LICENSE) [![Stay with Ukraine](https://img.shields.io/static/v1?label=Stay%20with&message=Ukraine%20♥&color=ffD700&labelColor=0057B8&style=flat)](https://u24.gov.ua/)
 
 # ledger
 
@@ -221,3 +221,7 @@ func handle(ctx context.Context, ev *paddle.Event) error {
 ## Ліцензія
 
 `ledger` поширюється за ліцензією MIT. Див. [LICENSE](LICENSE).
+
+## Реліз v1.0.0
+
+MemoryStore.Update перевіряє скасування контексту перед callback і перед застосуванням змін. Entries знаходить межу старої сторінки двійковим пошуком. Реліз v1 зберігає поточний import path і публічний API. Майбутні несумісні зміни потребуватимуть нової головної версії.

@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -50,10 +51,13 @@ func (s *MemoryStore) Wallet(_ context.Context, account string) (Wallet, error) 
 }
 
 // Update implements Store.
-func (s *MemoryStore) Update(_ context.Context, account string, fn func(View) (*Change, error)) error {
+func (s *MemoryStore) Update(ctx context.Context, account string, fn func(View) (*Change, error)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	w, ok := s.wallets[account]
 	if !ok {
 		w = Wallet{Account: account}
@@ -65,6 +69,9 @@ func (s *MemoryStore) Update(_ context.Context, account string, fn func(View) (*
 
 	// Check everything before writing anything, so a rejected change leaves
 	// the store exactly as it was.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	seen := map[string]bool{}
 	for _, e := range ch.Entries {
 		if _, dup := s.keys[account][e.Key]; dup || seen[e.Key] {
@@ -95,11 +102,12 @@ func (s *MemoryStore) Entries(_ context.Context, account string, before int64, l
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	all := s.entries[account]
+	if before > 0 {
+		end := sort.Search(len(all), func(i int) bool { return all[i].Seq >= before })
+		all = all[:end]
+	}
 	out := make([]Entry, 0, max(0, min(limit, len(all))))
 	for i := len(all) - 1; i >= 0 && len(out) < limit; i-- {
-		if before > 0 && all[i].Seq >= before {
-			continue
-		}
 		out = append(out, all[i])
 	}
 	return out, nil
