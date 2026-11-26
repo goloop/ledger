@@ -686,3 +686,7 @@ The standard library only.
 ## Release v1.0.0
 
 Honor canceled updates and seek older ledger pages with binary search. The v1 release keeps the existing import path and public API. Future incompatible changes require a new major version.
+
+## Usage notes
+
+Retrying an accepted idempotency key preserves the account journal. Releasing a hold still settles it when the replacement bonus balance is at MaxAmount.

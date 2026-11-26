@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Keep retries from changing the wallet and settle full bonus buckets.
 
+Explain replay and release guarantees.
+
 ## [1.0.0] - 2026-10-18
 
 Honor canceled updates and seek older ledger pages with binary search. The v1 release keeps the existing import path and public API. Future incompatible changes require a new major version.
