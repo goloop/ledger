@@ -729,7 +729,14 @@ func (l *Ledger) settle(ctx context.Context, account, holdID string, to HoldStat
 			en.Key = reservedPrefix + "release:" + h.ID
 			en.Bonus, en.Purchased = h.FromBonus, h.FromPurchased-h.Reversed
 			replaced = h.FromBonus > 0 && h.BonusPeriod != u.w.BonusPeriod
-			if h.FromBonus > 0 && !replaced && u.w.BonusExpiresAt.IsZero() {
+			// When a gross refund would overflow, record only the net
+			// movement. Credits from the old period are already forfeited.
+			if replaced && en.Bonus > MaxAmount-u.w.Bonus {
+				en.Bonus = 0
+				en.Note = "bonus of a replaced period forfeited on release"
+				replaced = false
+			}
+			if h.FromBonus > 0 && h.BonusPeriod == u.w.BonusPeriod && u.w.BonusExpiresAt.IsZero() {
 				u.w.BonusExpiresAt = u.now.Add(l.grace)
 			}
 		}
@@ -769,10 +776,13 @@ func (l *Ledger) update(ctx context.Context, account string, fn func(*unit) erro
 		if err := u.expire(); err != nil {
 			return nil, err
 		}
+		// Expiry is committed only with a new movement. A replay must
+		// leave the wallet and its journal untouched.
+		first := len(u.entries)
 		if err := fn(u); err != nil {
 			return nil, err
 		}
-		if !u.dirty {
+		if len(u.entries) == first {
 			return nil, nil
 		}
 		u.w.UpdatedAt = u.now
@@ -789,7 +799,6 @@ type unit struct {
 	now     time.Time
 	entries []Entry
 	holds   []Hold
-	dirty   bool
 }
 
 // move applies an entry's changes to the wallet and queues the entry. The
@@ -812,7 +821,6 @@ func (u *unit) move(e Entry) error {
 	e.PurchasedAfter = purchased
 	e.At = u.now
 	u.entries = append(u.entries, e)
-	u.dirty = true
 	return nil
 }
 
@@ -848,7 +856,6 @@ func (u *unit) expire() error {
 		}
 	}
 	u.w.BonusExpiresAt = time.Time{}
-	u.dirty = true
 	return nil
 }
 
