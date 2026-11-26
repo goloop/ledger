@@ -532,3 +532,31 @@ func TestOneRefundOneReversal(t *testing.T) {
 	}
 	want(t, l, "a", 0, 100)
 }
+
+func TestReplayPreservesPendingExpiry(t *testing.T) {
+	l, store, clock := newLedger(t)
+	mustOK(t, l.Grant(ctx, "a", ledger.Grant{Key: "bonus", Amount: 2, Until: t0.Add(time.Hour)}))
+	deposit := ledger.Deposit{Key: "purchase", Amount: 4}
+	mustOK(t, l.Deposit(ctx, "a", deposit))
+	before, err := store.Wallet(ctx, "a")
+	mustOK(t, err)
+	clock.Add(time.Hour)
+	mustOK(t, l.Deposit(ctx, "a", deposit))
+	after, err := store.Wallet(ctx, "a")
+	mustOK(t, err)
+	if after != before {
+		t.Fatalf("retry changed stored wallet from %+v to %+v", before, after)
+	}
+}
+
+func TestReleaseAfterReplacementAtLimit(t *testing.T) {
+	l, _, _ := newLedger(t)
+	mustOK(t, l.Deposit(ctx, "a", ledger.Deposit{Key: "fund", Amount: 4}))
+	mustOK(t, l.Grant(ctx, "a", ledger.Grant{Key: "old", Amount: 1, Until: month()}))
+	h, err := l.Hold(ctx, "a", ledger.Charge{Key: "job", Amount: 2})
+	mustOK(t, err)
+	mustOK(t, l.Grant(ctx, "a", ledger.Grant{Key: "new", Amount: ledger.MaxAmount, Until: month(), Replace: true}))
+	mustOK(t, l.Release(ctx, "a", h.ID))
+	want(t, l, "a", ledger.MaxAmount, 4)
+	mustOK(t, l.Audit(ctx, "a"))
+}
